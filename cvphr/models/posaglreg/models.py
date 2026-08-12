@@ -81,6 +81,147 @@ class SimilarityPositionPrior(nn.Module):
         pos_prior = pos_prior.sum(dim=1)  # [B, 2]
         return pos_prior
 
+
+class RSTGlobalContextFusion(nn.Module):
+    """Fuse the four contiguous RST feature maps and inject global context."""
+
+    def __init__(
+        self,
+        feature_dim=256,
+        descriptor_dim=1024,
+        token_grid_size=4,
+        num_heads=8,
+        feedforward_dim=512,
+        dropout=0.1,
+    ):
+        super().__init__()
+        if feature_dim % num_heads != 0:
+            raise ValueError(
+                f"feature_dim ({feature_dim}) must be divisible by num_heads ({num_heads})"
+            )
+
+        self.feature_dim = feature_dim
+        self.descriptor_dim = descriptor_dim
+        self.token_grid_size = token_grid_size
+
+        self.cross_boundary = nn.Sequential(
+            nn.Conv2d(feature_dim, feature_dim, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(feature_dim),
+            nn.GELU(),
+        )
+        self.token_pool = nn.AdaptiveAvgPool2d((token_grid_size, token_grid_size))
+        self.position_embedding = nn.Parameter(
+            torch.zeros(1, token_grid_size * token_grid_size, feature_dim)
+        )
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=feature_dim,
+            nhead=num_heads,
+            dim_feedforward=feedforward_dim,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=1)
+        self.context_projection = nn.Sequential(
+            nn.Linear(feature_dim * 2, descriptor_dim),
+            nn.GELU(),
+            nn.LayerNorm(descriptor_dim),
+        )
+        self.gate = nn.Linear(descriptor_dim * 2, 1)
+
+        nn.init.trunc_normal_(self.position_embedding, std=0.02)
+        nn.init.zeros_(self.gate.weight)
+        nn.init.constant_(self.gate.bias, -2.0)
+
+    @staticmethod
+    def build_mosaic(rst_maps):
+        """Arrange p1-p4 in their real crop order: [[p1, p2], [p3, p4]]."""
+        if rst_maps.dim() != 5 or rst_maps.size(1) != 4:
+            raise ValueError(
+                f"Expected RST maps shaped [B, 4, C, H, W], got {tuple(rst_maps.shape)}"
+            )
+        top = torch.cat((rst_maps[:, 0], rst_maps[:, 1]), dim=-1)
+        bottom = torch.cat((rst_maps[:, 2], rst_maps[:, 3]), dim=-1)
+        return torch.cat((top, bottom), dim=-2)
+
+    @staticmethod
+    def split_mosaic(mosaic, patch_height, patch_width):
+        """Split a 2x2 mosaic back into p1-p4 order."""
+        expected_hw = (patch_height * 2, patch_width * 2)
+        if mosaic.shape[-2:] != expected_hw:
+            raise ValueError(
+                f"Expected mosaic spatial size {expected_hw}, got {tuple(mosaic.shape[-2:])}"
+            )
+        return torch.stack(
+            (
+                mosaic[:, :, :patch_height, :patch_width],
+                mosaic[:, :, :patch_height, patch_width:],
+                mosaic[:, :, patch_height:, :patch_width],
+                mosaic[:, :, patch_height:, patch_width:],
+            ),
+            dim=1,
+        )
+
+    def forward(self, rst_maps, rst_descriptors):
+        if rst_descriptors.dim() != 3 or rst_descriptors.size(1) != 4:
+            raise ValueError(
+                "Expected RST descriptors shaped [B, 4, descriptor_dim], "
+                f"got {tuple(rst_descriptors.shape)}"
+            )
+        if rst_maps.size(0) != rst_descriptors.size(0):
+            raise ValueError("RST maps and descriptors must have the same batch size")
+        if rst_maps.size(2) != self.feature_dim:
+            raise ValueError(
+                f"Expected {self.feature_dim} map channels, got {rst_maps.size(2)}"
+            )
+        if rst_descriptors.size(2) != self.descriptor_dim:
+            raise ValueError(
+                f"Expected descriptor dim {self.descriptor_dim}, got {rst_descriptors.size(2)}"
+            )
+
+        patch_height, patch_width = rst_maps.shape[-2:]
+        mosaic = self.build_mosaic(rst_maps)
+        boundary_features = self.cross_boundary(mosaic)
+
+        token_features = self.token_pool(boundary_features)
+        tokens = token_features.flatten(2).transpose(1, 2)
+        tokens = self.transformer(tokens + self.position_embedding)
+        token_features = tokens.transpose(1, 2).reshape(
+            rst_maps.size(0),
+            self.feature_dim,
+            self.token_grid_size,
+            self.token_grid_size,
+        )
+        token_features = F.interpolate(
+            token_features,
+            size=boundary_features.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+        global_map = boundary_features + token_features
+
+        quadrant_maps = self.split_mosaic(global_map, patch_height, patch_width)
+        quadrant_context = quadrant_maps.mean(dim=(-2, -1))
+        global_context = global_map.mean(dim=(-2, -1)).unsqueeze(1).expand(-1, 4, -1)
+        context_descriptors = F.normalize(
+            self.context_projection(
+                torch.cat((quadrant_context, global_context), dim=-1)
+            ),
+            p=2,
+            dim=-1,
+        )
+
+        gate_values = torch.sigmoid(
+            self.gate(torch.cat((rst_descriptors, context_descriptors), dim=-1))
+        )
+        fused_descriptors = F.normalize(
+            rst_descriptors + gate_values * context_descriptors,
+            p=2,
+            dim=-1,
+        )
+        return fused_descriptors
+
 class PositionAngleRegressionSGM(nn.Module):
     def __init__(self, 
                  feature_dim=256, 
@@ -434,6 +575,91 @@ class PARCASGM_v5a(PARCASGM_v5):
         self.sgm.backbone = self.backbone
 
 
+class PARCASGM_v5a_GlobalRST(PARCASGM_v5a):
+    """Experiment B: add global context among four contiguous RSTs."""
+
+    def __init__(
+        self,
+        backbone_name='vgg16',
+        feature_dim=256,
+        coord_enc_dims=[16, 64, 256],
+        regressor_dims=[1024, 256, 64],
+        reduction_ratio=1,
+        num_clusters=4,
+        freeze_backbone=True,
+        partial_unfreeze=False,
+        add_patch_coord=True,
+        global_token_grid_size=4,
+        global_num_heads=8,
+        global_feedforward_dim=512,
+        global_dropout=0.1,
+    ):
+        super().__init__(
+            backbone_name=backbone_name,
+            feature_dim=feature_dim,
+            coord_enc_dims=coord_enc_dims,
+            regressor_dims=regressor_dims,
+            reduction_ratio=reduction_ratio,
+            num_clusters=num_clusters,
+            freeze_backbone=freeze_backbone,
+            partial_unfreeze=partial_unfreeze,
+            add_patch_coord=add_patch_coord,
+        )
+        self.model_name = 'phr5_globalrst_b'
+        descriptor_dim = feature_dim * num_clusters
+        self.rst_global_fusion = RSTGlobalContextFusion(
+            feature_dim=feature_dim,
+            descriptor_dim=descriptor_dim,
+            token_grid_size=global_token_grid_size,
+            num_heads=global_num_heads,
+            feedforward_dim=global_feedforward_dim,
+            dropout=global_dropout,
+        )
+
+    def forward(self, patches, debug_dir=''):
+        # patches: [B, 5, C, H, W], ordered as p1, p2, p3, p4, UAV.
+        if patches.dim() != 5 or patches.size(1) != 5:
+            raise ValueError(
+                f"Expected patches shaped [B, 5, C, H, W], got {tuple(patches.shape)}"
+            )
+
+        batch_size = patches.size(0)
+        sgm_outputs = [self.sgm(patches[:, i]) for i in range(5)]
+
+        rst_descriptors = torch.stack(
+            [output['descriptor_flatten'] for output in sgm_outputs[:4]],
+            dim=1,
+        )
+        rst_maps = torch.stack(
+            [output['nl_feat'] for output in sgm_outputs[:4]],
+            dim=1,
+        )
+        neighbor_feats = self.rst_global_fusion(rst_maps, rst_descriptors)
+        uav_patch_feature = sgm_outputs[4]['descriptor_flatten']
+
+        known_coords = torch.tensor(
+            [[-1.0, -1.0], [-1.0, 1.0], [1.0, -1.0], [1.0, 1.0]],
+            dtype=patches.dtype,
+            device=patches.device,
+        )
+        coord_embs = self.coord_encoder(known_coords).unsqueeze(0).repeat(
+            batch_size, 1, 1
+        )
+
+        pos_soft_prior = self.sim_pos_prior(uav_patch_feature, neighbor_feats)
+        cross_attn_feats = neighbor_feats
+        if self.add_patch_coord:
+            cross_attn_feats = cross_attn_feats + coord_embs
+
+        ctx_feat = self.neighbors_cross_attn(uav_patch_feature, cross_attn_feats)
+        combined = torch.cat((uav_patch_feature, ctx_feat), dim=1)
+        combined_with_prior = torch.cat((combined, pos_soft_prior), dim=1)
+
+        pos_pred = self.pos_regressor(combined_with_prior)
+        dir_pred = self.dir_regressor(combined)
+        return pos_pred, dir_pred
+
+
 class RSBlockDatasetPA_v3q(Dataset):
     """
     Remote sensing data processing class and its processing pipeline design
@@ -702,6 +928,14 @@ model_kwargs_par_ca_sgm_v5a={
     'add_patch_coord':True, 
 }
 
+model_kwargs_par_ca_sgm_v5a_globalrst = {
+    **model_kwargs_par_ca_sgm_v5a,
+    'global_token_grid_size': 4,
+    'global_num_heads': 8,
+    'global_feedforward_dim': 512,
+    'global_dropout': 0.1,
+}
+
 
 """****************************************************************************
 *                                                                             *
@@ -712,11 +946,13 @@ model_kwargs_par_ca_sgm_v5a={
 MODEL_CLASS_DICT = {
     "PARCASGM_v5":          PARCASGM_v5,
     "PARCASGM_v5a":         PARCASGM_v5a,
+    "PARCASGM_v5a_GlobalRST": PARCASGM_v5a_GlobalRST,
 }
 
 MODEL_KEYWARDS_DICT = {
     "PARCASGM_v5":          model_kwargs_par_ca_sgm_v5a,
     "PARCASGM_v5a":         model_kwargs_par_ca_sgm_v5a,
+    "PARCASGM_v5a_GlobalRST": model_kwargs_par_ca_sgm_v5a_globalrst,
 }
 
 DATASET_CLASS_DICT = {
