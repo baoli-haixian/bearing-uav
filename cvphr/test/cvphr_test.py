@@ -33,11 +33,10 @@ from cvphr.utils.utils import (
     read_json_file)
 # import model
 from cvphr.models.posaglreg.models import (
-    model_kwargs_par_ca_sgm_v5a,
     par_dataloader,
     DATASET_CLASS_DICT)
 ###############################################
-from cvphr.models.posaglreg.models import MODEL_CLASS_DICT
+from cvphr.models.posaglreg.models import MODEL_CLASS_DICT, MODEL_KEYWARDS_DICT
 
 
 def extract_rsi_id_from_path(rsi_type, target_path):
@@ -605,7 +604,7 @@ if __name__ == '__main__':
         reminder_proper_rsi_type('254k', rsi_type)  # Auto-check if rsi_type is correct
 
         # Model params
-        model_kwargs = model_kwargs_par_ca_sgm_v5a
+        model_kwargs = MODEL_KEYWARDS_DICT[args.model_class]
 
         test_id = rsi_id
         if rsi_id == 71:

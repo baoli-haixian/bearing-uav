@@ -70,15 +70,19 @@ class SimilarityPositionPrior(nn.Module):
             dtype=torch.float32
         ))
 
-    def forward(self, ft, neighbor_feats):
+    def forward(self, ft, neighbor_feats, temperature=1.0, return_weights=False):
+        if temperature <= 0:
+            raise ValueError(f"temperature must be positive, got {temperature}")
         B, D = ft.size()
         fi_expand = ft.unsqueeze(1).expand(-1, 4, -1)  # [B, 4, D]
         sim = self.cos(fi_expand, neighbor_feats)  # [B, 4]
-        weights = torch.softmax(sim, dim=1)  # [B, 4]
+        weights = torch.softmax(sim / temperature, dim=1)  # [B, 4]
 
         # Weighted relative position
         pos_prior = weights.unsqueeze(2) * self.rel_coords.unsqueeze(0)  # [B, 4, 2]
         pos_prior = pos_prior.sum(dim=1)  # [B, 2]
+        if return_weights:
+            return pos_prior, weights
         return pos_prior
 
 
@@ -163,7 +167,7 @@ class RSTGlobalContextFusion(nn.Module):
             dim=1,
         )
 
-    def forward(self, rst_maps, rst_descriptors):
+    def forward(self, rst_maps, rst_descriptors, return_aux=False):
         if rst_descriptors.dim() != 3 or rst_descriptors.size(1) != 4:
             raise ValueError(
                 "Expected RST descriptors shaped [B, 4, descriptor_dim], "
@@ -220,6 +224,12 @@ class RSTGlobalContextFusion(nn.Module):
             p=2,
             dim=-1,
         )
+        if return_aux:
+            return fused_descriptors, {
+                'original_descriptors': rst_descriptors,
+                'context_descriptors': context_descriptors,
+                'gate_values': gate_values,
+            }
         return fused_descriptors
 
 class PositionAngleRegressionSGM(nn.Module):
@@ -616,7 +626,13 @@ class PARCASGM_v5a_GlobalRST(PARCASGM_v5a):
             dropout=global_dropout,
         )
 
-    def forward(self, patches, debug_dir=''):
+    def forward(
+        self,
+        patches,
+        debug_dir='',
+        return_aux=False,
+        attention_temperature=1.0,
+    ):
         # patches: [B, 5, C, H, W], ordered as p1, p2, p3, p4, UAV.
         if patches.dim() != 5 or patches.size(1) != 5:
             raise ValueError(
@@ -634,7 +650,13 @@ class PARCASGM_v5a_GlobalRST(PARCASGM_v5a):
             [output['nl_feat'] for output in sgm_outputs[:4]],
             dim=1,
         )
-        neighbor_feats = self.rst_global_fusion(rst_maps, rst_descriptors)
+        fusion_output = self.rst_global_fusion(
+            rst_maps, rst_descriptors, return_aux=return_aux
+        )
+        if return_aux:
+            neighbor_feats, auxiliary = fusion_output
+        else:
+            neighbor_feats = fusion_output
         uav_patch_feature = sgm_outputs[4]['descriptor_flatten']
 
         known_coords = torch.tensor(
@@ -646,7 +668,18 @@ class PARCASGM_v5a_GlobalRST(PARCASGM_v5a):
             batch_size, 1, 1
         )
 
-        pos_soft_prior = self.sim_pos_prior(uav_patch_feature, neighbor_feats)
+        prior_output = self.sim_pos_prior(
+            uav_patch_feature,
+            neighbor_feats,
+            temperature=attention_temperature,
+            return_weights=return_aux,
+        )
+        if return_aux:
+            pos_soft_prior, attention_weights = prior_output
+            auxiliary['attention_weights'] = attention_weights
+            auxiliary['position_prior'] = pos_soft_prior
+        else:
+            pos_soft_prior = prior_output
         cross_attn_feats = neighbor_feats
         if self.add_patch_coord:
             cross_attn_feats = cross_attn_feats + coord_embs
@@ -657,7 +690,115 @@ class PARCASGM_v5a_GlobalRST(PARCASGM_v5a):
 
         pos_pred = self.pos_regressor(combined_with_prior)
         dir_pred = self.dir_regressor(combined)
+        if return_aux:
+            return pos_pred, dir_pred, auxiliary
         return pos_pred, dir_pred
+
+
+class PARCASGM_v5a_GlobalRST_Aux(PARCASGM_v5a_GlobalRST):
+    """Experiment E: global RST fusion with quadrant and geometry constraints."""
+
+    uses_auxiliary_losses = True
+
+    def __init__(
+        self,
+        backbone_name='vgg16',
+        feature_dim=256,
+        coord_enc_dims=[16, 64, 256],
+        regressor_dims=[1024, 256, 64],
+        reduction_ratio=1,
+        num_clusters=4,
+        freeze_backbone=True,
+        partial_unfreeze=False,
+        add_patch_coord=True,
+        global_token_grid_size=4,
+        global_num_heads=8,
+        global_feedforward_dim=512,
+        global_dropout=0.1,
+        quad_loss_weight=0.05,
+        attention_loss_weight=0.10,
+        auxiliary_warmup_epochs=5,
+        attention_temperature=1.0,
+    ):
+        super().__init__(
+            backbone_name=backbone_name,
+            feature_dim=feature_dim,
+            coord_enc_dims=coord_enc_dims,
+            regressor_dims=regressor_dims,
+            reduction_ratio=reduction_ratio,
+            num_clusters=num_clusters,
+            freeze_backbone=freeze_backbone,
+            partial_unfreeze=partial_unfreeze,
+            add_patch_coord=add_patch_coord,
+            global_token_grid_size=global_token_grid_size,
+            global_num_heads=global_num_heads,
+            global_feedforward_dim=global_feedforward_dim,
+            global_dropout=global_dropout,
+        )
+        if quad_loss_weight < 0 or attention_loss_weight < 0:
+            raise ValueError("Auxiliary loss weights must be non-negative")
+        if auxiliary_warmup_epochs < 0:
+            raise ValueError("auxiliary_warmup_epochs must be non-negative")
+        if attention_temperature <= 0:
+            raise ValueError("attention_temperature must be positive")
+
+        self.model_name = 'phr5_globalrst_e'
+        self.quad_loss_weight = quad_loss_weight
+        self.attention_loss_weight = attention_loss_weight
+        self.auxiliary_warmup_epochs = auxiliary_warmup_epochs
+        self.attention_temperature = attention_temperature
+
+    def forward(self, patches, debug_dir='', return_aux=False):
+        return super().forward(
+            patches,
+            debug_dir=debug_dir,
+            return_aux=return_aux,
+            attention_temperature=self.attention_temperature,
+        )
+
+    def auxiliary_weight_scale(self, epoch):
+        if self.auxiliary_warmup_epochs == 0:
+            return 1.0
+        return min(1.0, float(epoch + 1) / self.auxiliary_warmup_epochs)
+
+    def compute_auxiliary_losses(self, auxiliary, coords, epoch):
+        original = auxiliary['original_descriptors'].detach()
+        context = auxiliary['context_descriptors']
+        loss_quad = (1.0 - F.cosine_similarity(context, original, dim=-1)).mean()
+
+        rel_coords = self.sim_pos_prior.rel_coords.to(
+            device=coords.device, dtype=coords.dtype
+        )
+        geometry_weights = (
+            (1.0 + coords[:, None, 0] * rel_coords[None, :, 0])
+            * (1.0 + coords[:, None, 1] * rel_coords[None, :, 1])
+            / 4.0
+        )
+        geometry_weights = geometry_weights.clamp_min(0.0)
+        geometry_weights = geometry_weights / geometry_weights.sum(
+            dim=1, keepdim=True
+        ).clamp_min(1e-6)
+
+        attention_weights = auxiliary['attention_weights']
+        loss_attention = F.kl_div(
+            attention_weights.float().clamp_min(1e-6).log(),
+            geometry_weights.float(),
+            reduction='batchmean',
+        )
+
+        warmup_scale = self.auxiliary_weight_scale(epoch)
+        weighted_quad = warmup_scale * self.quad_loss_weight * loss_quad
+        weighted_attention = (
+            warmup_scale * self.attention_loss_weight * loss_attention
+        )
+        return {
+            'quad': loss_quad,
+            'attention': loss_attention,
+            'weighted_quad': weighted_quad,
+            'weighted_attention': weighted_attention,
+            'total': weighted_quad + weighted_attention,
+            'warmup_scale': warmup_scale,
+        }
 
 
 class RSBlockDatasetPA_v3q(Dataset):
@@ -936,6 +1077,14 @@ model_kwargs_par_ca_sgm_v5a_globalrst = {
     'global_dropout': 0.1,
 }
 
+model_kwargs_par_ca_sgm_v5a_globalrst_aux = {
+    **model_kwargs_par_ca_sgm_v5a_globalrst,
+    'quad_loss_weight': 0.05,
+    'attention_loss_weight': 0.10,
+    'auxiliary_warmup_epochs': 5,
+    'attention_temperature': 1.0,
+}
+
 
 """****************************************************************************
 *                                                                             *
@@ -947,12 +1096,14 @@ MODEL_CLASS_DICT = {
     "PARCASGM_v5":          PARCASGM_v5,
     "PARCASGM_v5a":         PARCASGM_v5a,
     "PARCASGM_v5a_GlobalRST": PARCASGM_v5a_GlobalRST,
+    "PARCASGM_v5a_GlobalRST_Aux": PARCASGM_v5a_GlobalRST_Aux,
 }
 
 MODEL_KEYWARDS_DICT = {
     "PARCASGM_v5":          model_kwargs_par_ca_sgm_v5a,
     "PARCASGM_v5a":         model_kwargs_par_ca_sgm_v5a,
     "PARCASGM_v5a_GlobalRST": model_kwargs_par_ca_sgm_v5a_globalrst,
+    "PARCASGM_v5a_GlobalRST_Aux": model_kwargs_par_ca_sgm_v5a_globalrst_aux,
 }
 
 DATASET_CLASS_DICT = {

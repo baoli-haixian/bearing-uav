@@ -226,6 +226,12 @@ def train_par(
     # Init training history
     history = {
         'train_loss': [],
+        'train_pose_loss': [],
+        'train_loss_quad': [],
+        'train_loss_attention': [],
+        'train_loss_quad_weighted': [],
+        'train_loss_attention_weighted': [],
+        'auxiliary_warmup_scale': [],
         'val_loss': [],
         'train_loss_pos': [],
         'train_loss_dir': [],
@@ -269,6 +275,9 @@ def train_par(
     )  # Global step counter
     stop_training = False
     d_tensor_validity = {}
+    uses_auxiliary_losses = bool(
+        getattr(raw_model, 'uses_auxiliary_losses', False)
+    )
 
     def _train_one_epoch(epoch):
         """Single epoch training logic."""
@@ -279,6 +288,9 @@ def train_par(
         epoch_train_loss = 0.0
         epoch_train_loss_pos = 0.0
         epoch_train_loss_dir = 0.0
+        epoch_train_loss_quad = 0.0
+        epoch_train_loss_attention = 0.0
+        auxiliary_warmup_scale = 0.0
 
         for batch_idx, batch in enumerate(train_loader):
             patches = batch["patches"].to(device, non_blocking=True)
@@ -288,12 +300,23 @@ def train_par(
 
             # Forward + Loss: in autocast for TensorCore
             with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
-                pos_pred, dir_pred = model(patches)
+                if uses_auxiliary_losses:
+                    pos_pred, dir_pred, auxiliary = model(
+                        patches, return_aux=True
+                    )
+                else:
+                    pos_pred, dir_pred = model(patches)
 
                 loss_pos = criterion(pos_pred, coords)
                 loss_dir = criterion(dir_pred, agl_coords)
                 pos_weight, dir_weight = pa_loss_weight
-                loss = pos_weight * loss_pos + dir_weight * loss_dir
+                loss_pose = pos_weight * loss_pos + dir_weight * loss_dir
+                loss = loss_pose
+                if uses_auxiliary_losses:
+                    auxiliary_losses = raw_model.compute_auxiliary_losses(
+                        auxiliary, coords, epoch
+                    )
+                    loss = loss + auxiliary_losses['total']
 
             # Backward (use GradScaler for mixed precision stability)
             scaler.scale(loss).backward()
@@ -323,6 +346,14 @@ def train_par(
             epoch_train_loss += loss.item() * batch_size
             epoch_train_loss_pos += loss_pos.item() * batch_size
             epoch_train_loss_dir += loss_dir.item() * batch_size
+            if uses_auxiliary_losses:
+                epoch_train_loss_quad += (
+                    auxiliary_losses['quad'].item() * batch_size
+                )
+                epoch_train_loss_attention += (
+                    auxiliary_losses['attention'].item() * batch_size
+                )
+                auxiliary_warmup_scale = auxiliary_losses['warmup_scale']
 
             # Warmup + Cosine Scheduler step
             if scheduler_class == "CosineAnnealingLR":
@@ -333,7 +364,14 @@ def train_par(
                     scheduler.step()
                 global_step += 1
 
-        return epoch_train_loss, epoch_train_loss_pos, epoch_train_loss_dir
+        return (
+            epoch_train_loss,
+            epoch_train_loss_pos,
+            epoch_train_loss_dir,
+            epoch_train_loss_quad,
+            epoch_train_loss_attention,
+            auxiliary_warmup_scale,
+        )
 
     def _validate_one_epoch(epoch):
         """Single epoch validation logic."""
@@ -417,7 +455,14 @@ def train_par(
 
         # Training phase
         start_time = time.time()
-        train_loss, train_loss_pos, train_loss_dir = _train_one_epoch(epoch)
+        (
+            train_loss,
+            train_loss_pos,
+            train_loss_dir,
+            train_loss_quad,
+            train_loss_attention,
+            auxiliary_warmup_scale,
+        ) = _train_one_epoch(epoch)
         elapsed_time = time.time() - start_time
         print(f"Training time: {elapsed_time:.2f}s")
 
@@ -465,8 +510,40 @@ def train_par(
         # Record pos and dir loss separately
         train_loss_pos = train_loss_pos / len(train_loader.dataset)
         train_loss_dir = train_loss_dir / len(train_loader.dataset)
+        train_pose_loss = (
+            pa_loss_weight[0] * train_loss_pos
+            + pa_loss_weight[1] * train_loss_dir
+        )
+        train_loss_quad = train_loss_quad / len(train_loader.dataset)
+        train_loss_attention = train_loss_attention / len(train_loader.dataset)
+        if uses_auxiliary_losses:
+            train_loss_quad_weighted = (
+                auxiliary_warmup_scale
+                * raw_model.quad_loss_weight
+                * train_loss_quad
+            )
+            train_loss_attention_weighted = (
+                auxiliary_warmup_scale
+                * raw_model.attention_loss_weight
+                * train_loss_attention
+            )
+        else:
+            train_loss_quad_weighted = 0.0
+            train_loss_attention_weighted = 0.0
         val_loss_pos = val_loss_pos / len(val_loader.dataset)
         val_loss_dir = val_loss_dir / len(val_loader.dataset)
+        history.setdefault('train_pose_loss', []).append(train_pose_loss)
+        history.setdefault('train_loss_quad', []).append(train_loss_quad)
+        history.setdefault('train_loss_attention', []).append(train_loss_attention)
+        history.setdefault('train_loss_quad_weighted', []).append(
+            train_loss_quad_weighted
+        )
+        history.setdefault('train_loss_attention_weighted', []).append(
+            train_loss_attention_weighted
+        )
+        history.setdefault('auxiliary_warmup_scale', []).append(
+            auxiliary_warmup_scale
+        )
         history['train_loss_pos'].append(train_loss_pos)
         history['train_loss_dir'].append(train_loss_dir)
         history['val_loss_pos'].append(val_loss_pos)
@@ -476,6 +553,23 @@ def train_par(
 
         # Record to tensorboard
         writer.add_scalar('Loss/train', train_loss, epoch)
+        writer.add_scalar('Loss/train_pose', train_pose_loss, epoch)
+        if uses_auxiliary_losses:
+            writer.add_scalar('Loss/train_quad', train_loss_quad, epoch)
+            writer.add_scalar(
+                'Loss/train_quad_weighted', train_loss_quad_weighted, epoch
+            )
+            writer.add_scalar(
+                'Loss/train_attention', train_loss_attention, epoch
+            )
+            writer.add_scalar(
+                'Loss/train_attention_weighted',
+                train_loss_attention_weighted,
+                epoch,
+            )
+            writer.add_scalar(
+                'Loss/auxiliary_warmup_scale', auxiliary_warmup_scale, epoch
+            )
         writer.add_scalar('Loss/val', val_loss, epoch)
         writer.add_scalar('Loss/train_pos', train_loss_pos, epoch)
         writer.add_scalar('Loss/train_dir', train_loss_dir, epoch)
@@ -511,6 +605,7 @@ def train_par(
                 'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
                 'best_val_loss': best_checkpoint['val_loss'],
                 'best_epoch': best_checkpoint['epoch'],
+                'history': history,
                 'result_dir': result_dir,
             }
             latest_path = Path(result_dir) / 'ckpt_latest_model.pth'
@@ -554,6 +649,11 @@ def train_par(
                 f"Epoch {epoch+1}/{num_epochs} | "
                 f"train_loss={train_loss:.6f}, val_loss={val_loss:.6f}, "
                 f"train_pos={train_loss_pos:.6f}, train_dir={train_loss_dir:.6f}, "
+                f"train_quad={train_loss_quad:.6f}, "
+                f"train_attn={train_loss_attention:.6f}, "
+                f"weighted_quad={train_loss_quad_weighted:.6f}, "
+                f"weighted_attn={train_loss_attention_weighted:.6f}, "
+                f"aux_scale={auxiliary_warmup_scale:.3f}, "
                 f"val_pos={val_loss_pos:.6f}, val_dir={val_loss_dir:.6f}, "
                 f"lr={optimizer.param_groups[0]['lr']:.6e}\n"
             )
