@@ -801,6 +801,40 @@ class PARCASGM_v5a_GlobalRST_Aux(PARCASGM_v5a_GlobalRST):
         }
 
 
+class PARCASGM_v5a_GlobalRST_Quad(PARCASGM_v5a_GlobalRST_Aux):
+    """Experiment C: global RST fusion constrained only by L_quad."""
+
+    def __init__(self, *args, **kwargs):
+        attention_loss_weight = kwargs.pop('attention_loss_weight', 0.0)
+        if attention_loss_weight != 0:
+            raise ValueError(
+                "Experiment C requires attention_loss_weight=0"
+            )
+        kwargs.setdefault('quad_loss_weight', 0.05)
+        super().__init__(
+            *args,
+            attention_loss_weight=0.0,
+            **kwargs,
+        )
+        self.model_name = 'phr5_globalrst_c'
+
+
+class PARCASGM_v5a_GlobalRST_Attn(PARCASGM_v5a_GlobalRST_Aux):
+    """Experiment D: global RST fusion constrained only by L_attn."""
+
+    def __init__(self, *args, **kwargs):
+        quad_loss_weight = kwargs.pop('quad_loss_weight', 0.0)
+        if quad_loss_weight != 0:
+            raise ValueError("Experiment D requires quad_loss_weight=0")
+        kwargs.setdefault('attention_loss_weight', 0.10)
+        super().__init__(
+            *args,
+            quad_loss_weight=0.0,
+            **kwargs,
+        )
+        self.model_name = 'phr5_globalrst_d'
+
+
 class RSBlockDatasetPA_v3q(Dataset):
     """
     Remote sensing data processing class and its processing pipeline design
@@ -1085,6 +1119,22 @@ model_kwargs_par_ca_sgm_v5a_globalrst_aux = {
     'attention_temperature': 1.0,
 }
 
+model_kwargs_par_ca_sgm_v5a_globalrst_quad = {
+    **model_kwargs_par_ca_sgm_v5a_globalrst,
+    'quad_loss_weight': 0.05,
+    'attention_loss_weight': 0.0,
+    'auxiliary_warmup_epochs': 5,
+    'attention_temperature': 1.0,
+}
+
+model_kwargs_par_ca_sgm_v5a_globalrst_attn = {
+    **model_kwargs_par_ca_sgm_v5a_globalrst,
+    'quad_loss_weight': 0.0,
+    'attention_loss_weight': 0.10,
+    'auxiliary_warmup_epochs': 5,
+    'attention_temperature': 1.0,
+}
+
 
 """****************************************************************************
 *                                                                             *
@@ -1096,6 +1146,8 @@ MODEL_CLASS_DICT = {
     "PARCASGM_v5":          PARCASGM_v5,
     "PARCASGM_v5a":         PARCASGM_v5a,
     "PARCASGM_v5a_GlobalRST": PARCASGM_v5a_GlobalRST,
+    "PARCASGM_v5a_GlobalRST_Quad": PARCASGM_v5a_GlobalRST_Quad,
+    "PARCASGM_v5a_GlobalRST_Attn": PARCASGM_v5a_GlobalRST_Attn,
     "PARCASGM_v5a_GlobalRST_Aux": PARCASGM_v5a_GlobalRST_Aux,
 }
 
@@ -1103,6 +1155,8 @@ MODEL_KEYWARDS_DICT = {
     "PARCASGM_v5":          model_kwargs_par_ca_sgm_v5a,
     "PARCASGM_v5a":         model_kwargs_par_ca_sgm_v5a,
     "PARCASGM_v5a_GlobalRST": model_kwargs_par_ca_sgm_v5a_globalrst,
+    "PARCASGM_v5a_GlobalRST_Quad": model_kwargs_par_ca_sgm_v5a_globalrst_quad,
+    "PARCASGM_v5a_GlobalRST_Attn": model_kwargs_par_ca_sgm_v5a_globalrst_attn,
     "PARCASGM_v5a_GlobalRST_Aux": model_kwargs_par_ca_sgm_v5a_globalrst_aux,
 }
 
