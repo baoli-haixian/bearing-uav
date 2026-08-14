@@ -695,6 +695,87 @@ class PARCASGM_v5a_GlobalRST(PARCASGM_v5a):
         return pos_pred, dir_pred
 
 
+class PARCASGM_v5a_GlobalRST_PosPrior(PARCASGM_v5a_GlobalRST):
+    """Experiment F: use global RST context only in the position prior."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.model_name = 'phr5_globalrst_f'
+
+    def forward(
+        self,
+        patches,
+        debug_dir='',
+        return_aux=False,
+        attention_temperature=1.0,
+    ):
+        # patches: [B, 5, C, H, W], ordered as p1, p2, p3, p4, UAV.
+        if patches.dim() != 5 or patches.size(1) != 5:
+            raise ValueError(
+                f"Expected patches shaped [B, 5, C, H, W], got {tuple(patches.shape)}"
+            )
+
+        batch_size = patches.size(0)
+        sgm_outputs = [self.sgm(patches[:, i]) for i in range(5)]
+        original_rst_descriptors = torch.stack(
+            [output['descriptor_flatten'] for output in sgm_outputs[:4]],
+            dim=1,
+        )
+        rst_maps = torch.stack(
+            [output['nl_feat'] for output in sgm_outputs[:4]],
+            dim=1,
+        )
+        fusion_output = self.rst_global_fusion(
+            rst_maps, original_rst_descriptors, return_aux=return_aux
+        )
+        if return_aux:
+            global_rst_descriptors, auxiliary = fusion_output
+        else:
+            global_rst_descriptors = fusion_output
+
+        uav_patch_feature = sgm_outputs[4]['descriptor_flatten']
+        known_coords = torch.tensor(
+            [[-1.0, -1.0], [-1.0, 1.0], [1.0, -1.0], [1.0, 1.0]],
+            dtype=patches.dtype,
+            device=patches.device,
+        )
+        coord_embs = self.coord_encoder(known_coords).unsqueeze(0).repeat(
+            batch_size, 1, 1
+        )
+
+        # The global descriptors influence only the PSG position prior.
+        prior_output = self.sim_pos_prior(
+            uav_patch_feature,
+            global_rst_descriptors,
+            temperature=attention_temperature,
+            return_weights=return_aux,
+        )
+        if return_aux:
+            pos_soft_prior, attention_weights = prior_output
+            auxiliary['attention_weights'] = attention_weights
+            auxiliary['position_prior'] = pos_soft_prior
+            auxiliary['global_rst_descriptors'] = global_rst_descriptors
+        else:
+            pos_soft_prior = prior_output
+
+        # Keep the official CA and heading path on the original RST descriptors.
+        cross_attn_feats = original_rst_descriptors
+        if self.add_patch_coord:
+            cross_attn_feats = cross_attn_feats + coord_embs
+        ctx_feat = self.neighbors_cross_attn(
+            uav_patch_feature, cross_attn_feats
+        )
+
+        combined = torch.cat((uav_patch_feature, ctx_feat), dim=1)
+        pos_pred = self.pos_regressor(
+            torch.cat((combined, pos_soft_prior), dim=1)
+        )
+        dir_pred = self.dir_regressor(combined)
+        if return_aux:
+            return pos_pred, dir_pred, auxiliary
+        return pos_pred, dir_pred
+
+
 class PARCASGM_v5a_GlobalRST_Aux(PARCASGM_v5a_GlobalRST):
     """Experiment E: global RST fusion with quadrant and geometry constraints."""
 
@@ -1146,6 +1227,7 @@ MODEL_CLASS_DICT = {
     "PARCASGM_v5":          PARCASGM_v5,
     "PARCASGM_v5a":         PARCASGM_v5a,
     "PARCASGM_v5a_GlobalRST": PARCASGM_v5a_GlobalRST,
+    "PARCASGM_v5a_GlobalRST_PosPrior": PARCASGM_v5a_GlobalRST_PosPrior,
     "PARCASGM_v5a_GlobalRST_Quad": PARCASGM_v5a_GlobalRST_Quad,
     "PARCASGM_v5a_GlobalRST_Attn": PARCASGM_v5a_GlobalRST_Attn,
     "PARCASGM_v5a_GlobalRST_Aux": PARCASGM_v5a_GlobalRST_Aux,
@@ -1155,6 +1237,7 @@ MODEL_KEYWARDS_DICT = {
     "PARCASGM_v5":          model_kwargs_par_ca_sgm_v5a,
     "PARCASGM_v5a":         model_kwargs_par_ca_sgm_v5a,
     "PARCASGM_v5a_GlobalRST": model_kwargs_par_ca_sgm_v5a_globalrst,
+    "PARCASGM_v5a_GlobalRST_PosPrior": model_kwargs_par_ca_sgm_v5a_globalrst,
     "PARCASGM_v5a_GlobalRST_Quad": model_kwargs_par_ca_sgm_v5a_globalrst_quad,
     "PARCASGM_v5a_GlobalRST_Attn": model_kwargs_par_ca_sgm_v5a_globalrst_attn,
     "PARCASGM_v5a_GlobalRST_Aux": model_kwargs_par_ca_sgm_v5a_globalrst_aux,

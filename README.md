@@ -198,6 +198,10 @@ pip install -r requirements.txt
 ./scripts/run_nav.sh
 ```
 
+## Ablation Experiments
+
+- [Experiment F: GlobalRST position-prior-only fusion](EXPERIMENT_F.md)
+
 # ✒️Citation
 ```text
 @article{xxx2026bearinguav,
