@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 import torch
 import torchvision
 import torch.nn as nn
+import torch.nn.functional as F
 from pathlib import Path
 from decimal import Decimal
 from typing import Literal, Tuple, List, Dict
@@ -1442,6 +1443,27 @@ def diagnose_val_batch(result_dir, batch_idx, epoch, patches, coords, agl_coords
         torchvision.utils.save_image(patches[0].cpu(), os.path.join(save_dir, "bad_patch.jpg"))
         print(f"Saved bad patch image to {save_dir}/bad_patch.jpg")
 
+class CircularDirectionLoss(nn.Module):
+    """Cosine distance on S1, aligned with the MHE evaluation geometry."""
+
+    def __init__(self, eps=1e-6, reduction='mean'):
+        super().__init__()
+        if reduction not in {'none', 'mean', 'sum'}:
+            raise ValueError(f"Unsupported reduction: {reduction}")
+        self.eps = eps
+        self.reduction = reduction
+
+    def forward(self, pred, target):
+        pred_unit = F.normalize(pred, p=2, dim=-1, eps=self.eps)
+        target_unit = F.normalize(target, p=2, dim=-1, eps=self.eps)
+        loss = 1.0 - torch.sum(pred_unit * target_unit, dim=-1).clamp(-1.0, 1.0)
+        if self.reduction == 'mean':
+            return loss.mean()
+        if self.reduction == 'sum':
+            return loss.sum()
+        return loss
+
+
 class MultiTaskLoss(nn.Module):
     def __init__(self, pos_weight=2.0, dir_weight=0.5):
         super().__init__()
@@ -1895,4 +1917,4 @@ def calc_alt_err_vec_batch(
 
 
 if __name__ == "__main__":
-    pass    
+    pass

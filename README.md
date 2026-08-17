@@ -201,6 +201,7 @@ pip install -r requirements.txt
 ## Ablation Experiments
 
 - [Experiment F: GlobalRST position-prior-only fusion](EXPERIMENT_F.md)
+- [实验 H1：单位圆约束航向回归](EXPERIMENT_H1.md)
 
 # ✒️Citation
 ```text

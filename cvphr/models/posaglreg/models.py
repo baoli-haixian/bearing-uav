@@ -58,6 +58,17 @@ class NeighborsCrossAttention(nn.Module):
         out = torch.bmm(attn, v).squeeze(1)  # [B, num_clusters * D/r]
         return out
 
+
+class UnitL2Normalize(nn.Module):
+    """Project a 2-D heading vector onto the unit circle."""
+
+    def __init__(self, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, vector):
+        return F.normalize(vector, p=2, dim=-1, eps=self.eps)
+
 class SimilarityPositionPrior(nn.Module):
     def __init__(self, feat_dim):
         super().__init__()
@@ -916,6 +927,41 @@ class PARCASGM_v5a_GlobalRST_Attn(PARCASGM_v5a_GlobalRST_Aux):
         self.model_name = 'phr5_globalrst_d'
 
 
+class PARCASGM_v5a_H1(PARCASGM_v5a):
+    """Experiment H1: unit-circle output and circular heading objective."""
+
+    default_loss_type = 'circular'
+
+    def __init__(self,
+                 backbone_name='vgg16',
+                 feature_dim=256,
+                 coord_enc_dims=[16, 64, 256],
+                 regressor_dims=[1024, 256, 64],
+                 reduction_ratio=1,
+                 num_clusters=4,
+                 freeze_backbone=True,
+                 partial_unfreeze=False,
+                 add_patch_coord=True,
+                 heading_norm_eps=1e-6):
+        super().__init__(
+            backbone_name=backbone_name,
+            feature_dim=feature_dim,
+            coord_enc_dims=coord_enc_dims,
+            regressor_dims=regressor_dims,
+            reduction_ratio=reduction_ratio,
+            num_clusters=num_clusters,
+            freeze_backbone=freeze_backbone,
+            partial_unfreeze=partial_unfreeze,
+            add_patch_coord=add_patch_coord,
+        )
+        self.model_name = 'phr5_h1_circle'
+        self.heading_norm_eps = heading_norm_eps
+        self.dir_regressor = nn.Sequential(
+            *list(self.dir_regressor.children()),
+            UnitL2Normalize(eps=heading_norm_eps),
+        )
+
+
 class RSBlockDatasetPA_v3q(Dataset):
     """
     Remote sensing data processing class and its processing pipeline design
@@ -1226,6 +1272,7 @@ model_kwargs_par_ca_sgm_v5a_globalrst_attn = {
 MODEL_CLASS_DICT = {
     "PARCASGM_v5":          PARCASGM_v5,
     "PARCASGM_v5a":         PARCASGM_v5a,
+    "PARCASGM_v5a_H1":      PARCASGM_v5a_H1,
     "PARCASGM_v5a_GlobalRST": PARCASGM_v5a_GlobalRST,
     "PARCASGM_v5a_GlobalRST_PosPrior": PARCASGM_v5a_GlobalRST_PosPrior,
     "PARCASGM_v5a_GlobalRST_Quad": PARCASGM_v5a_GlobalRST_Quad,
@@ -1236,6 +1283,7 @@ MODEL_CLASS_DICT = {
 MODEL_KEYWARDS_DICT = {
     "PARCASGM_v5":          model_kwargs_par_ca_sgm_v5a,
     "PARCASGM_v5a":         model_kwargs_par_ca_sgm_v5a,
+    "PARCASGM_v5a_H1":      model_kwargs_par_ca_sgm_v5a,
     "PARCASGM_v5a_GlobalRST": model_kwargs_par_ca_sgm_v5a_globalrst,
     "PARCASGM_v5a_GlobalRST_PosPrior": model_kwargs_par_ca_sgm_v5a_globalrst,
     "PARCASGM_v5a_GlobalRST_Quad": model_kwargs_par_ca_sgm_v5a_globalrst_quad,

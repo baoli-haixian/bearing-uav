@@ -30,6 +30,7 @@ from cvphr.utils.utils import (
     test_plot_abserr_par,
     plot_angle_error_analysis,
     plot_distance_error_analysis,
+    CircularDirectionLoss,
     read_json_file)
 # import model
 from cvphr.models.posaglreg.models import (
@@ -227,6 +228,7 @@ def test_par(dataset_dir,
     model_kwargs = model_kwargs or {}
     model = model_class(**model_kwargs).to(device)
     criterion = nn.SmoothL1Loss()
+    heading_criterion = CircularDirectionLoss() if loss_type == 'circular' else None
 
     # Load model weights
     # Use map_location to remap checkpoint device to current available device
@@ -278,9 +280,12 @@ def test_par(dataset_dir,
                 loss, loss_pos, loss_dir = criterion(
                     pos_pred, coords,
                     dir_pred, agl_coords)
-            elif loss_type == 'smoothl1':  # Joint training: same loss function
+            elif loss_type in {'smoothl1', 'circular'}:
                 loss_pos = criterion(pos_pred, coords)
-                loss_dir = criterion(dir_pred, agl_coords)
+                if heading_criterion is not None:
+                    loss_dir = heading_criterion(dir_pred, agl_coords)
+                else:
+                    loss_dir = criterion(dir_pred, agl_coords)
                 pos_weight, dir_weight = pa_loss_weight
                 loss = pos_weight * loss_pos + dir_weight * loss_dir
             elif loss_type == 'pos_smoothl1':  # Single-task: position
@@ -673,7 +678,7 @@ if __name__ == '__main__':
             #############################################################
             # Default params, no change needed
             factor_bslr = 1/32
-            loss_type = 'smoothl1'
+            loss_type = getattr(model_class, 'default_loss_type', 'smoothl1')
             pa_loss_weight = PH_LOSS_WEIGHT
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             test_result_dir = f'{train_result_dir}/test_results_{dset_name}_{rsi_id}_{timestamp}'

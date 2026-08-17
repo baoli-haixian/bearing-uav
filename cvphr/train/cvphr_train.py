@@ -36,6 +36,7 @@ from cvphr.utils.utils import (
     compute_grad_norm_stat_mean,
     save_monitor_history,
     diagnose_val_batch,
+    CircularDirectionLoss,
     MultiTaskLoss)
 # export model
 from cvphr.models.posaglreg.models import (
@@ -152,9 +153,17 @@ def train_par(
     # Loss enhancement options
     # Support SmoothL1Loss and HuberLoss, priority read loss_type from model_kwargs
     pos_weight, dir_weight = pa_loss_weight
+    heading_criterion = None
     if loss_type == 'huber':
         criterion = nn.HuberLoss(delta=1.0)  # HuberLoss(delta=2.0~5.0)
         print('Using loss function: HuberLoss(delta=1.0)')
+    elif loss_type == 'circular':
+        criterion = nn.SmoothL1Loss()
+        heading_criterion = CircularDirectionLoss()
+        print(
+            f'Using loss functions: SmoothL1Loss(position) + '
+            f'CircularDirectionLoss(heading), weights={pa_loss_weight}'
+        )
     elif loss_type == 'smoothl1' or loss_type == 'pos_smoothl1' or loss_type == 'dir_smoothl1':
         criterion = nn.SmoothL1Loss()
         print(f'Using loss function: SmoothL1Loss(pos_weight={pos_weight}, dir_weight={dir_weight})')
@@ -195,6 +204,9 @@ def train_par(
         'model_backbone': model.backbone_name,
         'loss_type': loss_type,
         'pa_loss_weight': pa_loss_weight,
+        'heading_criterion_class': (
+            type(heading_criterion).__name__ if heading_criterion is not None else None
+        ),
         "optimizer_class": type(optimizer).__name__,
         "criterion_class": type(criterion).__name__,
         "scheduler_class": type(scheduler).__name__,
@@ -308,7 +320,10 @@ def train_par(
                     pos_pred, dir_pred = model(patches)
 
                 loss_pos = criterion(pos_pred, coords)
-                loss_dir = criterion(dir_pred, agl_coords)
+                if heading_criterion is not None:
+                    loss_dir = heading_criterion(dir_pred, agl_coords)
+                else:
+                    loss_dir = criterion(dir_pred, agl_coords)
                 pos_weight, dir_weight = pa_loss_weight
                 loss_pose = pos_weight * loss_pos + dir_weight * loss_dir
                 loss = loss_pose
@@ -399,7 +414,10 @@ def train_par(
 
                 # 'smoothl1', 'huber': joint training, calculate loss directly in validation
                 loss_pos = criterion(pos_pred, coords)
-                loss_dir = criterion(dir_pred, agl_coords)
+                if heading_criterion is not None:
+                    loss_dir = heading_criterion(dir_pred, agl_coords)
+                else:
+                    loss_dir = criterion(dir_pred, agl_coords)
                 pos_weight, dir_weight = pa_loss_weight
                 loss = pos_weight * loss_pos + dir_weight * loss_dir
 
@@ -839,7 +857,7 @@ if __name__ == '__main__':
         #############################################################
 
         # No modification needed below
-        loss_type = 'smoothl1'  # 'smoothl1', 'huber','multitask','pos_smoothl1','dir_smoothl1'
+        loss_type = getattr(model_class, 'default_loss_type', 'smoothl1')
         scheduler_class = 'ReduceLROnPlateau'
         print(f"Model Backbone: {model_kwargs['backbone_name']}")
 
