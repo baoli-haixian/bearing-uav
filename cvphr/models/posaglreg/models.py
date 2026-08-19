@@ -600,7 +600,9 @@ class MSPCOCHeadingHead(nn.Module):
             device=probability.device, dtype=probability.dtype
         )
         raw_heading = probability @ basis
-        resultant = torch.linalg.vector_norm(raw_heading, dim=-1)
+        resultant = torch.sqrt(
+            raw_heading.square().sum(dim=-1) + 1e-12
+        )
         corr_heading = raw_heading / resultant.clamp_min(1e-6).unsqueeze(-1)
         max_probability = probability.max(dim=-1).values
         entropy = -(
@@ -628,6 +630,345 @@ class MSPCOCHeadingHead(nn.Module):
             'resultant': resultant,
             'rst_polar': rst_polar,
             'uav_direction': uav_direction,
+        }
+
+
+class GeometryPoseVolumeHeadingHead(nn.Module):
+    """Geometry-preserving joint translation-orientation heading head."""
+
+    def __init__(
+        self,
+        input_dim=256,
+        feature_dim=64,
+        spatial_size=8,
+        candidate_grid_size=9,
+        candidate_radius=0.5,
+        num_angle_bins=36,
+        crop_half_extent=0.5,
+        orientation_temperature=0.1,
+        translation_temperature=0.2,
+        residual_limit_degrees=5.0,
+    ):
+        super().__init__()
+        if candidate_grid_size < 1 or candidate_grid_size % 2 == 0:
+            raise ValueError("candidate_grid_size must be a positive odd number")
+        if num_angle_bins < 4 or num_angle_bins % 2 != 0:
+            raise ValueError("num_angle_bins must be even and at least four")
+        if min(
+            feature_dim,
+            spatial_size,
+            candidate_radius,
+            crop_half_extent,
+            orientation_temperature,
+            translation_temperature,
+        ) <= 0:
+            raise ValueError("GPRV-H dimensions, radii, and temperatures must be positive")
+
+        self.feature_dim = int(feature_dim)
+        self.spatial_size = int(spatial_size)
+        self.candidate_grid_size = int(candidate_grid_size)
+        self.num_angle_bins = int(num_angle_bins)
+        self.crop_half_extent = float(crop_half_extent)
+        self.orientation_temperature = float(orientation_temperature)
+        self.translation_temperature = float(translation_temperature)
+        self.residual_limit = math.radians(float(residual_limit_degrees))
+
+        def projector():
+            return nn.Sequential(
+                nn.Conv2d(input_dim, feature_dim, kernel_size=1, bias=False),
+                nn.GroupNorm(8, feature_dim),
+                nn.GELU(),
+                nn.Conv2d(
+                    feature_dim,
+                    feature_dim,
+                    kernel_size=3,
+                    padding=1,
+                    groups=feature_dim,
+                    bias=False,
+                ),
+                nn.Conv2d(feature_dim, feature_dim, kernel_size=1, bias=False),
+                nn.GroupNorm(8, feature_dim),
+                nn.GELU(),
+            )
+
+        self.rst_projector = projector()
+        self.uav_projector = projector()
+        self.uav_confidence = nn.Conv2d(feature_dim, 1, kernel_size=1)
+        self.geometry_bias = nn.Sequential(
+            nn.Linear(4, 32),
+            nn.GELU(),
+            nn.Linear(32, 1),
+        )
+        phase_input_dim = 2 * feature_dim + 5
+        self.phase_refiner = nn.Sequential(
+            nn.Linear(phase_input_dim, 64),
+            nn.GELU(),
+            nn.Linear(64, 3),
+        )
+
+        axis = torch.linspace(
+            -float(candidate_radius),
+            float(candidate_radius),
+            candidate_grid_size,
+        )
+        offset_y, offset_x = torch.meshgrid(axis, axis, indexing='ij')
+        self.register_buffer(
+            'candidate_offsets',
+            torch.stack((offset_x, offset_y), dim=-1).reshape(-1, 2),
+        )
+        angles = torch.arange(num_angle_bins, dtype=torch.float32)
+        angles = angles * (2.0 * math.pi / num_angle_bins)
+        self.register_buffer('angles', angles)
+        self.register_buffer(
+            'heading_basis', torch.stack((angles.cos(), angles.sin()), dim=-1)
+        )
+
+    @staticmethod
+    def build_mosaic(rst_maps):
+        return RSTGlobalContextFusion.build_mosaic(rst_maps)
+
+    @staticmethod
+    def position_to_grid_center(position):
+        return PositionConditionedPolarSampler.position_to_grid_center(position)
+
+    @staticmethod
+    def _rotate_heading(heading, angle):
+        cosine = angle.cos()
+        sine = angle.sin()
+        x_coord, y_coord = heading.unbind(dim=-1)
+        return torch.stack(
+            (cosine * x_coord - sine * y_coord,
+             sine * x_coord + cosine * y_coord),
+            dim=-1,
+        )
+
+    def _rotation_bank(self, feature, confidence=None):
+        batch_size = feature.size(0)
+        angles = self.angles.to(device=feature.device, dtype=feature.dtype)
+        cosine = angles.cos()
+        sine = angles.sin()
+        matrices = torch.zeros(
+            self.num_angle_bins, 2, 3, device=feature.device, dtype=feature.dtype
+        )
+        # affine_grid maps output coordinates to input coordinates. This sign
+        # makes bin k align a UAV feature rotated by -theta_k with the RST map.
+        matrices[:, 0, 0] = cosine
+        matrices[:, 0, 1] = -sine
+        matrices[:, 1, 0] = sine
+        matrices[:, 1, 1] = cosine
+        matrices = matrices.unsqueeze(0).expand(batch_size, -1, -1, -1)
+        matrices = matrices.reshape(batch_size * self.num_angle_bins, 2, 3)
+        expanded = feature[:, None].expand(
+            -1, self.num_angle_bins, -1, -1, -1
+        ).reshape(
+            batch_size * self.num_angle_bins,
+            feature.size(1),
+            feature.size(2),
+            feature.size(3),
+        )
+        grid = F.affine_grid(matrices, expanded.shape, align_corners=False)
+        rotated = F.grid_sample(
+            expanded,
+            grid,
+            mode='bilinear',
+            padding_mode='zeros',
+            align_corners=False,
+        ).reshape(
+            batch_size,
+            self.num_angle_bins,
+            feature.size(1),
+            feature.size(2),
+            feature.size(3),
+        )
+        if confidence is None:
+            return rotated
+        expanded_confidence = confidence[:, None].expand(
+            -1, self.num_angle_bins, -1, -1, -1
+        ).reshape(
+            batch_size * self.num_angle_bins,
+            1,
+            confidence.size(2),
+            confidence.size(3),
+        )
+        rotated_confidence = F.grid_sample(
+            expanded_confidence,
+            grid,
+            mode='bilinear',
+            padding_mode='zeros',
+            align_corners=False,
+        ).reshape(
+            batch_size,
+            self.num_angle_bins,
+            confidence.size(1),
+            confidence.size(2),
+            confidence.size(3),
+        )
+        return rotated, rotated_confidence
+
+    def _candidate_crops(self, mosaic, position):
+        batch_size, channels = mosaic.shape[:2]
+        center = self.position_to_grid_center(position).to(dtype=mosaic.dtype)
+        offsets = self.candidate_offsets.to(
+            device=mosaic.device, dtype=mosaic.dtype
+        )
+        candidate_centers = center[:, None] + offsets[None] / 2.0
+
+        sample_axis = (
+            (torch.arange(self.spatial_size, device=mosaic.device, dtype=mosaic.dtype)
+             + 0.5)
+            / self.spatial_size
+            * 2.0
+            - 1.0
+        ) * self.crop_half_extent
+        sample_y, sample_x = torch.meshgrid(sample_axis, sample_axis, indexing='ij')
+        local_grid = torch.stack((sample_x, sample_y), dim=-1)
+        grid = candidate_centers[:, :, None, None, :] + local_grid[None, None]
+        num_candidates = offsets.size(0)
+        expanded = mosaic[:, None].expand(
+            -1, num_candidates, -1, -1, -1
+        ).reshape(
+            batch_size * num_candidates,
+            channels,
+            mosaic.size(-2),
+            mosaic.size(-1),
+        )
+        crops = F.grid_sample(
+            expanded,
+            grid.reshape(
+                batch_size * num_candidates,
+                self.spatial_size,
+                self.spatial_size,
+                2,
+            ),
+            mode='bilinear',
+            padding_mode='zeros',
+            align_corners=False,
+        )
+        return crops.reshape(
+            batch_size,
+            num_candidates,
+            channels,
+            self.spatial_size,
+            self.spatial_size,
+        )
+
+    def _pose_volume(self, rst_mosaic, uav_feature, position):
+        crops = self._candidate_crops(rst_mosaic, position)
+        confidence = torch.sigmoid(self.uav_confidence(uav_feature))
+        rotated_uav, rotated_confidence = self._rotation_bank(
+            uav_feature, confidence
+        )
+        rotated_uav = F.normalize(rotated_uav, p=2, dim=2, eps=1e-6)
+        crops = F.normalize(crops, p=2, dim=2, eps=1e-6)
+        weights = rotated_confidence.squeeze(2)
+        scores = torch.einsum(
+            'bkchw,bnchw,bkhw->bnk', rotated_uav, crops, weights
+        ) / weights.sum(dim=(-2, -1)).clamp_min(1e-6)[:, None, :]
+
+        offsets = self.candidate_offsets.to(
+            device=scores.device, dtype=scores.dtype
+        )
+        angles = self.angles.to(device=scores.device, dtype=scores.dtype)
+        geometry = torch.cat(
+            (
+                offsets[:, None].expand(-1, self.num_angle_bins, -1),
+                angles.cos()[None, :, None].expand(offsets.size(0), -1, -1),
+                angles.sin()[None, :, None].expand(offsets.size(0), -1, -1),
+            ),
+            dim=-1,
+        )
+        scores = scores + self.geometry_bias(geometry).squeeze(-1).unsqueeze(0)
+        return scores, crops, uav_feature
+
+    def forward(self, rst_maps, uav_map, position, base_heading=None):
+        batch_size, num_rst, channels, height, width = rst_maps.shape
+        if num_rst != 4:
+            raise ValueError("GPRV-H requires exactly four RST feature maps")
+        projected_rst = self.rst_projector(
+            rst_maps.reshape(batch_size * num_rst, channels, height, width)
+        )
+        projected_rst = F.adaptive_avg_pool2d(
+            projected_rst, (self.spatial_size, self.spatial_size)
+        ).reshape(
+            batch_size,
+            num_rst,
+            self.feature_dim,
+            self.spatial_size,
+            self.spatial_size,
+        )
+        projected_uav = F.adaptive_avg_pool2d(
+            self.uav_projector(uav_map),
+            (self.spatial_size, self.spatial_size),
+        )
+        rst_mosaic = self.build_mosaic(projected_rst)
+        volume_logits, crops, uav_feature = self._pose_volume(
+            rst_mosaic, projected_uav, position.detach()
+        )
+
+        orientation_logits = self.translation_temperature * torch.logsumexp(
+            volume_logits / self.translation_temperature, dim=1
+        )
+        orientation_probability = torch.softmax(
+            orientation_logits / self.orientation_temperature, dim=-1
+        )
+        basis = self.heading_basis.to(
+            device=orientation_probability.device,
+            dtype=orientation_probability.dtype,
+        )
+        raw_heading = orientation_probability @ basis
+        resultant = torch.sqrt(
+            raw_heading.square().sum(dim=-1) + 1e-12
+        )
+        coarse_heading = raw_heading / resultant.clamp_min(1e-6).unsqueeze(-1)
+
+        position_logits = torch.logsumexp(volume_logits, dim=-1)
+        position_probability = torch.softmax(position_logits, dim=-1)
+        rst_summary = torch.einsum(
+            'bn,bnc->bc', position_probability, crops.mean(dim=(-2, -1))
+        )
+        uav_summary = uav_feature.mean(dim=(-2, -1))
+        max_probability = orientation_probability.max(dim=-1).values
+        entropy = -(
+            orientation_probability
+            * orientation_probability.clamp_min(1e-8).log()
+        ).sum(dim=-1) / math.log(self.num_angle_bins)
+        phase_input = torch.cat(
+            (
+                uav_summary,
+                rst_summary,
+                coarse_heading,
+                max_probability.unsqueeze(-1),
+                (1.0 - entropy).unsqueeze(-1),
+                resultant.unsqueeze(-1),
+            ),
+            dim=-1,
+        )
+        phase_output = self.phase_refiner(phase_input)
+        residual = torch.tanh(phase_output[:, 0]) * self.residual_limit
+        final_heading = F.normalize(
+            self._rotate_heading(coarse_heading, residual),
+            p=2,
+            dim=-1,
+            eps=1e-6,
+        )
+        phase2_heading = F.normalize(
+            phase_output[:, 1:3], p=2, dim=-1, eps=1e-6
+        )
+        volume_probability = torch.softmax(
+            volume_logits.flatten(1) / self.orientation_temperature, dim=-1
+        ).reshape_as(volume_logits)
+        return final_heading, {
+            'pose_volume_logits': volume_logits,
+            'pose_volume_probability': volume_probability,
+            'orientation_logits': orientation_logits,
+            'orientation_probability': orientation_probability,
+            'position_probability': position_probability,
+            'coarse_heading': coarse_heading,
+            'final_heading': final_heading,
+            'phase2_heading': phase2_heading,
+            'phase_residual': residual,
+            'resultant': resultant,
+            'candidate_offsets': self.candidate_offsets,
         }
 
 class PositionAngleRegressionSGM(nn.Module):
@@ -1513,7 +1854,9 @@ class PARCASGM_v5a_MSPCOC(PARCASGM_v5a):
         delta = torch.atan2(cross, dot)
         return F.smooth_l1_loss(delta, torch.zeros_like(delta))
 
-    def compute_heading_losses(self, auxiliary, target_heading):
+    def compute_heading_losses(
+        self, auxiliary, target_heading, target_position=None
+    ):
         probability = auxiliary['orientation_probability'].float()
         target_heading = F.normalize(
             target_heading.float(), p=2, dim=-1, eps=1e-6
@@ -1545,6 +1888,247 @@ class PARCASGM_v5a_MSPCOC(PARCASGM_v5a):
             'distribution': distribution,
             'correlation': correlation,
             'final': final,
+            'total': total,
+        }
+
+
+class PARCASGM_v5a_GPRVH(PARCASGM_v5a):
+    """Experiment H3-D: geometry-preserved rotation pose-volume heading."""
+
+    model_name = 'phr5_h3d_gprvh'
+    default_optimizer = 'AdamW'
+    default_learning_rate = 1e-4
+    requires_init_checkpoint = True
+    uses_heading_distribution_loss = True
+    initialization_missing_prefixes = ('gprv_head.',)
+
+    def __init__(
+        self,
+        backbone_name='vgg16',
+        feature_dim=256,
+        coord_enc_dims=[16, 64, 256],
+        regressor_dims=[1024, 256, 64],
+        reduction_ratio=1,
+        num_clusters=4,
+        freeze_backbone=True,
+        partial_unfreeze=False,
+        add_patch_coord=True,
+        heading_feature_dim=64,
+        heading_spatial_size=8,
+        heading_candidate_grid_size=9,
+        heading_candidate_radius=0.5,
+        heading_angle_bins=36,
+        heading_crop_half_extent=0.5,
+        heading_orientation_temperature=0.1,
+        heading_translation_temperature=0.2,
+        heading_residual_limit_degrees=5.0,
+        heading_position_sigma=0.15,
+        heading_kappa=20.0,
+        heading_volume_weight=1.0,
+        heading_circle_weight=0.5,
+        heading_phase2_weight=0.15,
+        heading_opposite_weight=0.1,
+        heading_opposite_margin=0.2,
+        freeze_base=True,
+    ):
+        super().__init__(
+            backbone_name=backbone_name,
+            feature_dim=feature_dim,
+            coord_enc_dims=coord_enc_dims,
+            regressor_dims=regressor_dims,
+            reduction_ratio=reduction_ratio,
+            num_clusters=num_clusters,
+            freeze_backbone=freeze_backbone,
+            partial_unfreeze=partial_unfreeze,
+            add_patch_coord=add_patch_coord,
+        )
+        if heading_position_sigma <= 0 or heading_kappa <= 0:
+            raise ValueError("H3-D position sigma and heading kappa must be positive")
+        if min(
+            heading_volume_weight,
+            heading_circle_weight,
+            heading_phase2_weight,
+            heading_opposite_weight,
+            heading_opposite_margin,
+        ) < 0:
+            raise ValueError("H3-D loss weights and margin must be non-negative")
+
+        self.model_name = type(self).model_name
+        self.freeze_base = bool(freeze_base)
+        self.heading_position_sigma = float(heading_position_sigma)
+        self.heading_kappa = float(heading_kappa)
+        self.heading_volume_weight = float(heading_volume_weight)
+        self.heading_circle_weight = float(heading_circle_weight)
+        self.heading_phase2_weight = float(heading_phase2_weight)
+        self.heading_opposite_weight = float(heading_opposite_weight)
+        self.heading_opposite_margin = float(heading_opposite_margin)
+        if self.freeze_base:
+            for parameter in self.parameters():
+                parameter.requires_grad = False
+        self.gprv_head = GeometryPoseVolumeHeadingHead(
+            input_dim=feature_dim,
+            feature_dim=heading_feature_dim,
+            spatial_size=heading_spatial_size,
+            candidate_grid_size=heading_candidate_grid_size,
+            candidate_radius=heading_candidate_radius,
+            num_angle_bins=heading_angle_bins,
+            crop_half_extent=heading_crop_half_extent,
+            orientation_temperature=heading_orientation_temperature,
+            translation_temperature=heading_translation_temperature,
+            residual_limit_degrees=heading_residual_limit_degrees,
+        )
+
+    def train(self, mode=True):
+        super().train(mode)
+        if mode and self.freeze_base:
+            for name, module in self.named_children():
+                if name != 'gprv_head':
+                    module.eval()
+            self.gprv_head.train(True)
+        return self
+
+    def _official_forward_with_maps(self, patches):
+        batch_size = patches.size(0)
+        sgm_outputs = [self.sgm(patches[:, index]) for index in range(5)]
+        rst_descriptors = torch.stack(
+            [output['descriptor_flatten'] for output in sgm_outputs[:4]], dim=1
+        )
+        rst_maps = torch.stack(
+            [output['nl_feat'] for output in sgm_outputs[:4]], dim=1
+        )
+        uav_descriptor = sgm_outputs[4]['descriptor_flatten']
+        uav_map = sgm_outputs[4]['nl_feat']
+        known_coords = torch.tensor(
+            [[-1.0, -1.0], [-1.0, 1.0], [1.0, -1.0], [1.0, 1.0]],
+            dtype=uav_descriptor.dtype,
+            device=uav_descriptor.device,
+        )
+        coord_embs = self.coord_encoder(known_coords).unsqueeze(0).expand(
+            batch_size, -1, -1
+        )
+        pos_soft_prior = self.sim_pos_prior(uav_descriptor, rst_descriptors)
+        cross_attention_features = rst_descriptors
+        if self.add_patch_coord:
+            cross_attention_features = cross_attention_features + coord_embs
+        context = self.neighbors_cross_attn(
+            uav_descriptor, cross_attention_features
+        )
+        combined = torch.cat((uav_descriptor, context), dim=1)
+        position = self.pos_regressor(
+            torch.cat((combined, pos_soft_prior), dim=1)
+        )
+        base_heading = self.dir_regressor(combined)
+        return position, base_heading, rst_maps, uav_map
+
+    def forward(
+        self,
+        patches,
+        debug_dir='',
+        return_aux=False,
+        heading_position=None,
+    ):
+        if patches.dim() != 5 or patches.size(1) != 5:
+            raise ValueError(
+                f"Expected patches shaped [B, 5, C, H, W], got {tuple(patches.shape)}"
+            )
+        if self.freeze_base:
+            with torch.no_grad():
+                position, base_heading, rst_maps, uav_map = (
+                    self._official_forward_with_maps(patches)
+                )
+        else:
+            position, base_heading, rst_maps, uav_map = (
+                self._official_forward_with_maps(patches)
+            )
+        correlation_center = position if heading_position is None else heading_position
+        final_heading, auxiliary = self.gprv_head(
+            rst_maps,
+            uav_map,
+            correlation_center,
+            base_heading,
+        )
+        auxiliary['heading_position'] = correlation_center.detach()
+        auxiliary['base_heading'] = F.normalize(
+            base_heading, p=2, dim=-1, eps=1e-6
+        )
+        if return_aux:
+            return position, final_heading, auxiliary
+        return position, final_heading
+
+    def compute_heading_losses(
+        self, auxiliary, target_heading, target_position=None
+    ):
+        if target_position is None:
+            raise ValueError("H3-D pose-volume loss requires target_position")
+        target_heading = F.normalize(
+            target_heading.float(), p=2, dim=-1, eps=1e-6
+        )
+        target_position = target_position.float()
+        target_angle = torch.atan2(target_heading[:, 1], target_heading[:, 0])
+        candidate_offsets = auxiliary['candidate_offsets'].float()
+        displacement = target_position - auxiliary['heading_position'].float()
+        position_delta = displacement[:, None] - candidate_offsets[None]
+        position_log_target = -position_delta.square().sum(dim=-1) / (
+            2.0 * self.heading_position_sigma ** 2
+        )
+
+        basis = self.gprv_head.heading_basis.float()
+        bin_angles = torch.atan2(basis[:, 1], basis[:, 0])
+        circular_offset = bin_angles[None] - target_angle[:, None]
+        angle_log_target = self.heading_kappa * torch.cos(circular_offset)
+        joint_log_target = (
+            position_log_target[:, :, None] + angle_log_target[:, None, :]
+        )
+        joint_target = torch.softmax(joint_log_target.flatten(1), dim=-1)
+        volume_log_probability = torch.log_softmax(
+            auxiliary['pose_volume_logits'].float().flatten(1)
+            / self.gprv_head.orientation_temperature,
+            dim=-1,
+        )
+        volume = -(joint_target * volume_log_probability).sum(dim=-1).mean()
+
+        final_heading = F.normalize(
+            auxiliary['final_heading'].float(), p=2, dim=-1, eps=1e-6
+        )
+        circle = (1.0 - (final_heading * target_heading).sum(dim=-1)).mean()
+        target_phase2 = torch.stack(
+            (torch.cos(2.0 * target_angle), torch.sin(2.0 * target_angle)),
+            dim=-1,
+        )
+        phase2_heading = F.normalize(
+            auxiliary['phase2_heading'].float(), p=2, dim=-1, eps=1e-6
+        )
+        phase2 = (
+            1.0 - (phase2_heading * target_phase2).sum(dim=-1)
+        ).mean()
+
+        wrapped_angle = torch.remainder(target_angle, 2.0 * math.pi)
+        target_index = torch.round(
+            wrapped_angle * self.gprv_head.num_angle_bins / (2.0 * math.pi)
+        ).long() % self.gprv_head.num_angle_bins
+        opposite_index = (
+            target_index + self.gprv_head.num_angle_bins // 2
+        ) % self.gprv_head.num_angle_bins
+        orientation_logits = auxiliary['orientation_logits'].float()
+        true_score = orientation_logits.gather(1, target_index[:, None]).squeeze(1)
+        opposite_score = orientation_logits.gather(
+            1, opposite_index[:, None]
+        ).squeeze(1)
+        opposite = F.relu(
+            self.heading_opposite_margin + opposite_score - true_score
+        ).mean()
+
+        total = (
+            self.heading_volume_weight * volume
+            + self.heading_circle_weight * circle
+            + self.heading_phase2_weight * phase2
+            + self.heading_opposite_weight * opposite
+        )
+        return {
+            'distribution': volume,
+            'correlation': phase2,
+            'final': circle,
+            'opposite': opposite,
             'total': total,
         }
 
@@ -1868,6 +2452,27 @@ model_kwargs_par_ca_sgm_v5a_mspcoc = {
     'freeze_base': True,
 }
 
+model_kwargs_par_ca_sgm_v5a_gprvh = {
+    **model_kwargs_par_ca_sgm_v5a,
+    'heading_feature_dim': 64,
+    'heading_spatial_size': 8,
+    'heading_candidate_grid_size': 9,
+    'heading_candidate_radius': 0.5,
+    'heading_angle_bins': 36,
+    'heading_crop_half_extent': 0.5,
+    'heading_orientation_temperature': 0.1,
+    'heading_translation_temperature': 0.2,
+    'heading_residual_limit_degrees': 5.0,
+    'heading_position_sigma': 0.15,
+    'heading_kappa': 20.0,
+    'heading_volume_weight': 1.0,
+    'heading_circle_weight': 0.5,
+    'heading_phase2_weight': 0.15,
+    'heading_opposite_weight': 0.1,
+    'heading_opposite_margin': 0.2,
+    'freeze_base': True,
+}
+
 
 """****************************************************************************
 *                                                                             *
@@ -1880,6 +2485,7 @@ MODEL_CLASS_DICT = {
     "PARCASGM_v5a":         PARCASGM_v5a,
     "PARCASGM_v5a_H1":      PARCASGM_v5a_H1,
     "PARCASGM_v5a_MSPCOC":  PARCASGM_v5a_MSPCOC,
+    "PARCASGM_v5a_GPRVH":   PARCASGM_v5a_GPRVH,
     "PARCASGM_v5a_GlobalRST": PARCASGM_v5a_GlobalRST,
     "PARCASGM_v5a_GlobalRST_PosPrior": PARCASGM_v5a_GlobalRST_PosPrior,
     "PARCASGM_v5a_GlobalRST_Quad": PARCASGM_v5a_GlobalRST_Quad,
@@ -1892,6 +2498,7 @@ MODEL_KEYWARDS_DICT = {
     "PARCASGM_v5a":         model_kwargs_par_ca_sgm_v5a,
     "PARCASGM_v5a_H1":      model_kwargs_par_ca_sgm_v5a,
     "PARCASGM_v5a_MSPCOC":  model_kwargs_par_ca_sgm_v5a_mspcoc,
+    "PARCASGM_v5a_GPRVH":   model_kwargs_par_ca_sgm_v5a_gprvh,
     "PARCASGM_v5a_GlobalRST": model_kwargs_par_ca_sgm_v5a_globalrst,
     "PARCASGM_v5a_GlobalRST_PosPrior": model_kwargs_par_ca_sgm_v5a_globalrst,
     "PARCASGM_v5a_GlobalRST_Quad": model_kwargs_par_ca_sgm_v5a_globalrst_quad,

@@ -54,7 +54,7 @@ from cvphr.test.cvphr_test import test_par
 
 
 def load_initial_model_weights(model, checkpoint_path):
-    """Load a baseline checkpoint while allowing only a new MS-PCOC head."""
+    """Load a baseline checkpoint while allowing only declared new modules."""
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
     state_dict = checkpoint.get('model_state_dict', checkpoint)
     if state_dict and all(key.startswith('module.') for key in state_dict):
@@ -62,22 +62,25 @@ def load_initial_model_weights(model, checkpoint_path):
             key[len('module.'):]: value for key, value in state_dict.items()
         }
     incompatible = model.load_state_dict(state_dict, strict=False)
+    missing_prefixes = getattr(
+        model, 'initialization_missing_prefixes', ('ms_pcoc_head.',)
+    )
     invalid_missing = [
         key for key in incompatible.missing_keys
-        if not key.startswith('ms_pcoc_head.')
+        if not key.startswith(tuple(missing_prefixes))
     ]
     if invalid_missing or incompatible.unexpected_keys:
         raise RuntimeError(
-            "Initial checkpoint is not compatible with the H2 baseline: "
+            "Initial checkpoint is not compatible with the requested baseline: "
             f"missing={invalid_missing}, unexpected={incompatible.unexpected_keys}"
         )
     if not incompatible.missing_keys:
         raise RuntimeError(
-            "H2 initialization expected missing ms_pcoc_head parameters, but none were found"
+            "Initialization expected newly added model parameters, but none were found"
         )
     print(
         f" - Loaded baseline checkpoint: {checkpoint_path} "
-        f"({len(incompatible.missing_keys)} new H2 tensors initialized)"
+        f"({len(incompatible.missing_keys)} new tensors initialized)"
     )
     return incompatible
 
@@ -410,7 +413,7 @@ def train_par(
                 loss_pos = criterion(pos_pred, coords)
                 if uses_heading_distribution_loss:
                     heading_losses = raw_model.compute_heading_losses(
-                        auxiliary, agl_coords
+                        auxiliary, agl_coords, target_position=coords
                     )
                     loss_dir = heading_losses['total']
                 elif heading_criterion is not None:
@@ -535,7 +538,7 @@ def train_par(
                 loss_pos = criterion(pos_pred, coords)
                 if uses_heading_distribution_loss:
                     heading_losses = raw_model.compute_heading_losses(
-                        auxiliary, agl_coords
+                        auxiliary, agl_coords, target_position=coords
                     )
                     loss_dir = heading_losses['total']
                 elif heading_criterion is not None:
