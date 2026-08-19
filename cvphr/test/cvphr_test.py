@@ -229,6 +229,9 @@ def test_par(dataset_dir,
     model = model_class(**model_kwargs).to(device)
     criterion = nn.SmoothL1Loss()
     heading_criterion = CircularDirectionLoss() if loss_type == 'circular' else None
+    uses_heading_distribution_loss = bool(
+        getattr(model, 'uses_heading_distribution_loss', False)
+    )
 
     # Load model weights
     # Use map_location to remap checkpoint device to current available device
@@ -273,13 +276,25 @@ def test_par(dataset_dir,
             B = patches.size(0)
 
             # Predict relative position and vector direction
-            pos_pred, dir_pred = model(patches)
+            if uses_heading_distribution_loss:
+                pos_pred, dir_pred, auxiliary = model(
+                    patches, return_aux=True
+                )
+            else:
+                pos_pred, dir_pred = model(patches)
 
             # Handle multi-task, single-task, and joint training modes - compute test loss
             if loss_type == 'multitask':  # Multi-task: different loss functions
                 loss, loss_pos, loss_dir = criterion(
                     pos_pred, coords,
                     dir_pred, agl_coords)
+            elif loss_type == 'mspcoc':
+                loss_pos = criterion(pos_pred, coords)
+                loss_dir = model.compute_heading_losses(
+                    auxiliary, agl_coords
+                )['total']
+                pos_weight, dir_weight = pa_loss_weight
+                loss = pos_weight * loss_pos + dir_weight * loss_dir
             elif loss_type in {'smoothl1', 'circular'}:
                 loss_pos = criterion(pos_pred, coords)
                 if heading_criterion is not None:

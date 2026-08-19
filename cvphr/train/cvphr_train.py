@@ -53,6 +53,35 @@ from cvphr.models import DATASET_CLASS_DICT  # import dataset class dict
 from cvphr.test.cvphr_test import test_par
 
 
+def load_initial_model_weights(model, checkpoint_path):
+    """Load a baseline checkpoint while allowing only a new MS-PCOC head."""
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    state_dict = checkpoint.get('model_state_dict', checkpoint)
+    if state_dict and all(key.startswith('module.') for key in state_dict):
+        state_dict = {
+            key[len('module.'):]: value for key, value in state_dict.items()
+        }
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    invalid_missing = [
+        key for key in incompatible.missing_keys
+        if not key.startswith('ms_pcoc_head.')
+    ]
+    if invalid_missing or incompatible.unexpected_keys:
+        raise RuntimeError(
+            "Initial checkpoint is not compatible with the H2 baseline: "
+            f"missing={invalid_missing}, unexpected={incompatible.unexpected_keys}"
+        )
+    if not incompatible.missing_keys:
+        raise RuntimeError(
+            "H2 initialization expected missing ms_pcoc_head parameters, but none were found"
+        )
+    print(
+        f" - Loaded baseline checkpoint: {checkpoint_path} "
+        f"({len(incompatible.missing_keys)} new H2 tensors initialized)"
+    )
+    return incompatible
+
+
 def train_par(
     dataset_dir,
     device_id=0,
@@ -70,6 +99,9 @@ def train_par(
     max_grad_norm=1.5,  # New: gradient clipping threshold
     checkpoint_interval=20,
     resume_checkpoint=None,
+    init_checkpoint=None,
+    learning_rate=None,
+    optimizer_name=None,
     flag_test=False,
     flag_ckpt=False,
 ):
@@ -104,12 +136,28 @@ def train_par(
     print(f"Using device: {device}")
 
     # Key hyperparameters
-    inilr = factor_bslr * 1e-4
+    inilr = factor_bslr * 1e-4 if learning_rate is None else learning_rate
     BATCH_SIZE = int(32 * factor_bslr)
 
     # Init model
     model_kwargs = model_kwargs or {}
     model = model_class(**model_kwargs).to(device)
+
+    if resume_checkpoint and init_checkpoint:
+        raise ValueError("Use either resume_checkpoint or init_checkpoint, not both")
+    if init_checkpoint:
+        init_path = Path(init_checkpoint).expanduser()
+        if not init_path.exists():
+            raise FileNotFoundError(f"Initial checkpoint not found: {init_path}")
+        load_initial_model_weights(model, init_path)
+    elif (
+        getattr(model_class, 'requires_init_checkpoint', False)
+        and not resume_checkpoint
+    ):
+        raise ValueError(
+            f"{model_class.__name__} requires --init_checkpoint with an "
+            "experiment A/baseline checkpoint"
+        )
 
     # Create output dir / Load resume dir
     os.makedirs('results', exist_ok=True)
@@ -164,6 +212,12 @@ def train_par(
             f'Using loss functions: SmoothL1Loss(position) + '
             f'CircularDirectionLoss(heading), weights={pa_loss_weight}'
         )
+    elif loss_type == 'mspcoc':
+        criterion = nn.SmoothL1Loss()
+        print(
+            'Using MS-PCOC heading objective: von Mises distribution + '
+            'wrapped correlation/final losses'
+        )
     elif loss_type == 'smoothl1' or loss_type == 'pos_smoothl1' or loss_type == 'dir_smoothl1':
         criterion = nn.SmoothL1Loss()
         print(f'Using loss function: SmoothL1Loss(pos_weight={pos_weight}, dir_weight={dir_weight})')
@@ -175,9 +229,25 @@ def train_par(
     # --------------------------------------
 
     # scheduler_class = "ReduceLROnPlateau" #scheduler_class
+    trainable_parameters = [
+        parameter for parameter in model.parameters() if parameter.requires_grad
+    ]
+    if not trainable_parameters:
+        raise ValueError("Model has no trainable parameters")
+    if optimizer_name is None:
+        optimizer_name = (
+            'AdamW' if scheduler_class == "CosineAnnealingLR" else 'Adam'
+        )
+    if optimizer_name == 'AdamW':
+        optimizer = torch.optim.AdamW(
+            trainable_parameters, lr=inilr, weight_decay=1e-4
+        )
+    elif optimizer_name == 'Adam':
+        optimizer = torch.optim.Adam(trainable_parameters, lr=inilr)
+    else:
+        raise ValueError(f"Unsupported optimizer: {optimizer_name}")
+
     if scheduler_class == "CosineAnnealingLR":
-        # Optimizer: AdamW with weight decay
-        optimizer = torch.optim.AdamW(model.parameters(), lr=inilr, weight_decay=1e-4)
         # Warmup + Cosine Scheduler config
         total_steps = num_epochs * len(train_loader)  # Total training steps
         warmup_steps = int(0.1 * total_steps)        # Warmup for first 10% steps
@@ -191,7 +261,6 @@ def train_par(
 
         warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     elif scheduler_class == "ReduceLROnPlateau":
-        optimizer = torch.optim.Adam(model.parameters(), lr=inilr)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3, factor=0.5)
     else:
         raise ValueError(f"Unsupported scheduler: {scheduler_class}")
@@ -223,6 +292,7 @@ def train_par(
         'max_grad_norm': max_grad_norm,  # Record gradient clipping config
         'checkpoint_interval': checkpoint_interval,
         'resume_from': resume_path_str,
+        'init_checkpoint': str(init_checkpoint) if init_checkpoint else None,
         'result_dir': result_dir
     }
     # Define model info to save
@@ -249,6 +319,14 @@ def train_par(
         'train_loss_dir': [],
         'val_loss_pos': [],
         'val_loss_dir': [],
+        'train_loss_heading_distribution': [],
+        'train_loss_heading_correlation': [],
+        'train_loss_heading_final': [],
+        'train_heading_gate_mean': [],
+        'val_loss_heading_distribution': [],
+        'val_loss_heading_correlation': [],
+        'val_loss_heading_final': [],
+        'val_heading_gate_mean': [],
         'train_loss_sum_pos_dir': [],
         'val_loss_sum_pos_dir': [],
         'lr_history': [],
@@ -290,6 +368,12 @@ def train_par(
     uses_auxiliary_losses = bool(
         getattr(raw_model, 'uses_auxiliary_losses', False)
     )
+    uses_heading_distribution_loss = bool(
+        getattr(raw_model, 'uses_heading_distribution_loss', False)
+    )
+    returns_loss_auxiliary = (
+        uses_auxiliary_losses or uses_heading_distribution_loss
+    )
 
     def _train_one_epoch(epoch):
         """Single epoch training logic."""
@@ -302,6 +386,10 @@ def train_par(
         epoch_train_loss_dir = 0.0
         epoch_train_loss_quad = 0.0
         epoch_train_loss_attention = 0.0
+        epoch_heading_distribution = 0.0
+        epoch_heading_correlation = 0.0
+        epoch_heading_final = 0.0
+        epoch_heading_gate = 0.0
         auxiliary_warmup_scale = 0.0
 
         for batch_idx, batch in enumerate(train_loader):
@@ -312,7 +400,7 @@ def train_par(
 
             # Forward + Loss: in autocast for TensorCore
             with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
-                if uses_auxiliary_losses:
+                if returns_loss_auxiliary:
                     pos_pred, dir_pred, auxiliary = model(
                         patches, return_aux=True
                     )
@@ -320,7 +408,12 @@ def train_par(
                     pos_pred, dir_pred = model(patches)
 
                 loss_pos = criterion(pos_pred, coords)
-                if heading_criterion is not None:
+                if uses_heading_distribution_loss:
+                    heading_losses = raw_model.compute_heading_losses(
+                        auxiliary, agl_coords
+                    )
+                    loss_dir = heading_losses['total']
+                elif heading_criterion is not None:
                     loss_dir = heading_criterion(dir_pred, agl_coords)
                 else:
                     loss_dir = criterion(dir_pred, agl_coords)
@@ -361,6 +454,19 @@ def train_par(
             epoch_train_loss += loss.item() * batch_size
             epoch_train_loss_pos += loss_pos.item() * batch_size
             epoch_train_loss_dir += loss_dir.item() * batch_size
+            if uses_heading_distribution_loss:
+                epoch_heading_distribution += (
+                    heading_losses['distribution'].item() * batch_size
+                )
+                epoch_heading_correlation += (
+                    heading_losses['correlation'].item() * batch_size
+                )
+                epoch_heading_final += (
+                    heading_losses['final'].item() * batch_size
+                )
+                epoch_heading_gate += (
+                    auxiliary['gate'].detach().float().mean().item() * batch_size
+                )
             if uses_auxiliary_losses:
                 epoch_train_loss_quad += (
                     auxiliary_losses['quad'].item() * batch_size
@@ -386,6 +492,10 @@ def train_par(
             epoch_train_loss_quad,
             epoch_train_loss_attention,
             auxiliary_warmup_scale,
+            epoch_heading_distribution,
+            epoch_heading_correlation,
+            epoch_heading_final,
+            epoch_heading_gate,
         )
 
     def _validate_one_epoch(epoch):
@@ -396,6 +506,10 @@ def train_par(
         epoch_val_loss = 0.0
         epoch_val_loss_pos = 0.0
         epoch_val_loss_dir = 0.0
+        epoch_val_heading_distribution = 0.0
+        epoch_val_heading_correlation = 0.0
+        epoch_val_heading_final = 0.0
+        epoch_val_heading_gate = 0.0
         all_val_pos_pred = []
         all_val_dir_pred = []
         all_val_coords = []
@@ -410,11 +524,21 @@ def train_par(
 
                 # Enable autocast in validation for speed and consistent numeric distribution
                 with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
-                    pos_pred, dir_pred = model(patches)
+                    if returns_loss_auxiliary:
+                        pos_pred, dir_pred, auxiliary = model(
+                            patches, return_aux=True
+                        )
+                    else:
+                        pos_pred, dir_pred = model(patches)
 
                 # 'smoothl1', 'huber': joint training, calculate loss directly in validation
                 loss_pos = criterion(pos_pred, coords)
-                if heading_criterion is not None:
+                if uses_heading_distribution_loss:
+                    heading_losses = raw_model.compute_heading_losses(
+                        auxiliary, agl_coords
+                    )
+                    loss_dir = heading_losses['total']
+                elif heading_criterion is not None:
                     loss_dir = heading_criterion(dir_pred, agl_coords)
                 else:
                     loss_dir = criterion(dir_pred, agl_coords)
@@ -452,6 +576,19 @@ def train_par(
                 epoch_val_loss += loss.item() * batch_size
                 epoch_val_loss_pos += loss_pos.item() * batch_size
                 epoch_val_loss_dir += loss_dir.item() * batch_size
+                if uses_heading_distribution_loss:
+                    epoch_val_heading_distribution += (
+                        heading_losses['distribution'].item() * batch_size
+                    )
+                    epoch_val_heading_correlation += (
+                        heading_losses['correlation'].item() * batch_size
+                    )
+                    epoch_val_heading_final += (
+                        heading_losses['final'].item() * batch_size
+                    )
+                    epoch_val_heading_gate += (
+                        auxiliary['gate'].float().mean().item() * batch_size
+                    )
 
                 all_val_pos_pred.append(pos_pred.detach().cpu())
                 all_val_dir_pred.append(dir_pred.detach().cpu())
@@ -466,6 +603,10 @@ def train_par(
             all_val_dir_pred,
             all_val_coords,
             all_val_agl_coords,
+            epoch_val_heading_distribution,
+            epoch_val_heading_correlation,
+            epoch_val_heading_final,
+            epoch_val_heading_gate,
         )
 
     for epoch in range(start_epoch, num_epochs):
@@ -480,6 +621,10 @@ def train_par(
             train_loss_quad,
             train_loss_attention,
             auxiliary_warmup_scale,
+            train_heading_distribution,
+            train_heading_correlation,
+            train_heading_final,
+            train_heading_gate,
         ) = _train_one_epoch(epoch)
         elapsed_time = time.time() - start_time
         print(f"Training time: {elapsed_time:.2f}s")
@@ -498,6 +643,10 @@ def train_par(
             all_val_dir_pred,
             all_val_coords,
             all_val_agl_coords,
+            val_heading_distribution,
+            val_heading_correlation,
+            val_heading_final,
+            val_heading_gate,
         ) = _validate_one_epoch(epoch)
         elapsed_time = time.time() - start_time
         print(f"Validation time: {elapsed_time:.2f}s")
@@ -550,6 +699,14 @@ def train_par(
             train_loss_attention_weighted = 0.0
         val_loss_pos = val_loss_pos / len(val_loader.dataset)
         val_loss_dir = val_loss_dir / len(val_loader.dataset)
+        train_heading_distribution /= len(train_loader.dataset)
+        train_heading_correlation /= len(train_loader.dataset)
+        train_heading_final /= len(train_loader.dataset)
+        train_heading_gate /= len(train_loader.dataset)
+        val_heading_distribution /= len(val_loader.dataset)
+        val_heading_correlation /= len(val_loader.dataset)
+        val_heading_final /= len(val_loader.dataset)
+        val_heading_gate /= len(val_loader.dataset)
         history.setdefault('train_pose_loss', []).append(train_pose_loss)
         history.setdefault('train_loss_quad', []).append(train_loss_quad)
         history.setdefault('train_loss_attention', []).append(train_loss_attention)
@@ -566,6 +723,30 @@ def train_par(
         history['train_loss_dir'].append(train_loss_dir)
         history['val_loss_pos'].append(val_loss_pos)
         history['val_loss_dir'].append(val_loss_dir)
+        history.setdefault('train_loss_heading_distribution', []).append(
+            train_heading_distribution
+        )
+        history.setdefault('train_loss_heading_correlation', []).append(
+            train_heading_correlation
+        )
+        history.setdefault('train_loss_heading_final', []).append(
+            train_heading_final
+        )
+        history.setdefault('train_heading_gate_mean', []).append(
+            train_heading_gate
+        )
+        history.setdefault('val_loss_heading_distribution', []).append(
+            val_heading_distribution
+        )
+        history.setdefault('val_loss_heading_correlation', []).append(
+            val_heading_correlation
+        )
+        history.setdefault('val_loss_heading_final', []).append(
+            val_heading_final
+        )
+        history.setdefault('val_heading_gate_mean', []).append(
+            val_heading_gate
+        )
         history['train_loss_sum_pos_dir'].append([train_loss, train_loss_pos, train_loss_dir])
         history['val_loss_sum_pos_dir'].append([val_loss, val_loss_pos, val_loss_dir])
 
@@ -593,6 +774,23 @@ def train_par(
         writer.add_scalar('Loss/train_dir', train_loss_dir, epoch)
         writer.add_scalar('Loss/val_pos', val_loss_pos, epoch)
         writer.add_scalar('Loss/val_dir', val_loss_dir, epoch)
+        if uses_heading_distribution_loss:
+            writer.add_scalar(
+                'H2/train_distribution', train_heading_distribution, epoch
+            )
+            writer.add_scalar(
+                'H2/train_correlation', train_heading_correlation, epoch
+            )
+            writer.add_scalar('H2/train_final', train_heading_final, epoch)
+            writer.add_scalar('H2/train_gate_mean', train_heading_gate, epoch)
+            writer.add_scalar(
+                'H2/val_distribution', val_heading_distribution, epoch
+            )
+            writer.add_scalar(
+                'H2/val_correlation', val_heading_correlation, epoch
+            )
+            writer.add_scalar('H2/val_final', val_heading_final, epoch)
+            writer.add_scalar('H2/val_gate_mean', val_heading_gate, epoch)
         writer.add_scalar('Learning Rate', optimizer.param_groups[0]['lr'], epoch)
 
         if scheduler_class == "ReduceLROnPlateau":
@@ -754,6 +952,9 @@ if __name__ == '__main__':
     parser.add_argument("--model_class", type=str, default="PARCASGM_v5a", help="Model class")
     parser.add_argument("--dataset_class", type=str, default="RSBlockDatasetPA_v3q", help="Dataset class")        
     parser.add_argument('--resume', type=str, default='', help="Resume training from checkpoint")
+    parser.add_argument('--init_checkpoint', type=str, default='', help="Initialize a new experiment from baseline weights")
+    parser.add_argument('--learning_rate', type=float, default=None, help="Override factor_bslr-derived learning rate")
+    parser.add_argument('--optimizer', type=str, default='', choices=['', 'Adam', 'AdamW'], help="Override the model/default optimizer")
     parser.add_argument('--checkpoint_interval', type=int, default=20, help="Checkpoint save interval (epoch)")
     parser.add_argument('--flag_ckpt', type=int, default=0, help="Save checkpoints and weights,1-yes,0-no")
     parser.add_argument('--fast_train', type=int, default=0, help="Fast training,1-yes,0-no")
@@ -778,6 +979,17 @@ if __name__ == '__main__':
     model_kwargs = MODEL_KEYWARDS_DICT[args.model_class]  #model_kwargs should match
     dataset_class = DATASET_CLASS_DICT[args.dataset_class]
     resume_path = args.resume if args.resume else None  # Checkpoint path for resume
+    init_checkpoint = args.init_checkpoint if args.init_checkpoint else None
+    learning_rate = (
+        args.learning_rate
+        if args.learning_rate is not None
+        else getattr(model_class, 'default_learning_rate', None)
+    )
+    optimizer_name = (
+        args.optimizer
+        if args.optimizer
+        else getattr(model_class, 'default_optimizer', None)
+    )
     ckpt_interval = args.checkpoint_interval
     flag_ckpt = bool(args.flag_ckpt)
     fast_train = bool(args.fast_train)
@@ -796,6 +1008,9 @@ if __name__ == '__main__':
     print("model_kwargs:", model_kwargs)
     print("dataset_class:", dataset_class)
     print("resume_path:", resume_path)
+    print("init_checkpoint:", init_checkpoint)
+    print("learning_rate:", learning_rate)
+    print("optimizer:", optimizer_name)
     print("ckpt_interval:", ckpt_interval)
     print("flag_ckpt:", flag_ckpt)
     print("fast_train:", fast_train)
@@ -879,6 +1094,9 @@ if __name__ == '__main__':
             max_grad_norm=max_grad_norm,  # Gradient clip threshold 1 better than 0.5 (stricter)
             checkpoint_interval=ckpt_interval,
             resume_checkpoint=resume_path,
+            init_checkpoint=init_checkpoint,
+            learning_rate=learning_rate,
+            optimizer_name=optimizer_name,
             flag_test=flag_test,
             flag_ckpt=flag_ckpt
         )

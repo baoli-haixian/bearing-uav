@@ -15,6 +15,8 @@
 
 </div>
 
+Experiment guides: [H1 circular heading](EXPERIMENT_H1.md) | [H2 improved MS-PCOC](EXPERIMENT_H2.md)
+
 # Introduction
 
 We present Bearing-UAV and its navigation scheme Bearing-Naver. 

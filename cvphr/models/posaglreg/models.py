@@ -1,5 +1,6 @@
 # Bearing-UAV model.
 import os
+import math
 import cv2
 import json
 import warnings
@@ -242,6 +243,392 @@ class RSTGlobalContextFusion(nn.Module):
                 'gate_values': gate_values,
             }
         return fused_descriptors
+
+
+class PositionConditionedPolarSampler(nn.Module):
+    """Sample multi-scale polar RST features around a predicted RSB position."""
+
+    def __init__(
+        self,
+        num_radial_bins=8,
+        num_angle_bins=72,
+        crop_scales=(0.75, 1.0, 1.25),
+        base_radius=0.5,
+    ):
+        super().__init__()
+        if num_radial_bins <= 0 or num_angle_bins <= 1:
+            raise ValueError("Polar bin counts must be positive")
+        if base_radius <= 0:
+            raise ValueError("base_radius must be positive")
+        if not crop_scales or any(scale <= 0 for scale in crop_scales):
+            raise ValueError("crop_scales must contain positive values")
+
+        self.num_radial_bins = int(num_radial_bins)
+        self.num_angle_bins = int(num_angle_bins)
+        self.base_radius = float(base_radius)
+        self.register_buffer(
+            'crop_scales', torch.tensor(crop_scales, dtype=torch.float32)
+        )
+        angles = torch.arange(num_angle_bins, dtype=torch.float32)
+        angles = angles * (2.0 * math.pi / num_angle_bins)
+        self.register_buffer(
+            'angle_basis', torch.stack((angles.cos(), angles.sin()), dim=-1)
+        )
+
+    @staticmethod
+    def build_mosaic(rst_maps):
+        return RSTGlobalContextFusion.build_mosaic(rst_maps)
+
+    @staticmethod
+    def position_to_grid_center(position):
+        """Convert RSB x/y units to normalized 2x2-mosaic grid coordinates."""
+        if position.dim() != 2 or position.size(-1) != 2:
+            raise ValueError(
+                f"Expected positions shaped [B, 2], got {tuple(position.shape)}"
+            )
+        # Metadata uses 128 px per coordinate unit. The complete RSB is
+        # 512x512, so its grid_sample half-extent (256 px) equals two units.
+        return position / 2.0
+
+    def forward(self, rst_mosaic, position):
+        if rst_mosaic.dim() != 4:
+            raise ValueError(
+                f"Expected mosaic shaped [B, C, H, W], got {tuple(rst_mosaic.shape)}"
+            )
+        if rst_mosaic.size(0) != position.size(0):
+            raise ValueError("Mosaic and position batch sizes must match")
+
+        batch_size, channels = rst_mosaic.shape[:2]
+        dtype = rst_mosaic.dtype
+        device = rst_mosaic.device
+        center = self.position_to_grid_center(position).to(dtype=dtype)
+        scales = self.crop_scales.to(device=device, dtype=dtype)
+        angle_basis = self.angle_basis.to(device=device, dtype=dtype)
+        radius = (
+            torch.arange(self.num_radial_bins, device=device, dtype=dtype) + 0.5
+        ) / self.num_radial_bins
+        radius = radius * self.base_radius
+
+        offsets = (
+            scales[:, None, None, None]
+            * radius[None, :, None, None]
+            * angle_basis[None, None, :, :]
+        )
+        grid = center[:, None, None, None, :] + offsets[None, :, :, :, :]
+        num_scales = scales.numel()
+        sample_grid = grid.reshape(
+            batch_size * num_scales,
+            self.num_radial_bins,
+            self.num_angle_bins,
+            2,
+        )
+        expanded_mosaic = rst_mosaic[:, None].expand(
+            -1, num_scales, -1, -1, -1
+        ).reshape(
+            batch_size * num_scales,
+            channels,
+            rst_mosaic.size(-2),
+            rst_mosaic.size(-1),
+        )
+        sampled = F.grid_sample(
+            expanded_mosaic,
+            sample_grid,
+            mode='bilinear',
+            padding_mode='zeros',
+            align_corners=False,
+        )
+        return sampled.reshape(
+            batch_size,
+            num_scales,
+            channels,
+            self.num_radial_bins,
+            self.num_angle_bins,
+        )
+
+
+class UAVDirectionQueryEncoder(nn.Module):
+    """Learn UAV direction tokens without imposing a planar polar warp."""
+
+    def __init__(
+        self,
+        feature_dim=64,
+        num_radial_bins=8,
+        num_angle_bins=72,
+        num_heads=4,
+        dropout=0.1,
+    ):
+        super().__init__()
+        if feature_dim % num_heads != 0:
+            raise ValueError("feature_dim must be divisible by num_heads")
+        self.feature_dim = feature_dim
+        self.num_radial_bins = num_radial_bins
+        self.num_angle_bins = num_angle_bins
+        self.radial_queries = nn.Parameter(
+            torch.zeros(1, num_radial_bins, 1, feature_dim)
+        )
+        angles = torch.arange(num_angle_bins, dtype=torch.float32)
+        angles = angles * (2.0 * math.pi / num_angle_bins)
+        self.register_buffer(
+            'angle_basis', torch.stack((angles.cos(), angles.sin()), dim=-1)
+        )
+        self.angle_projection = nn.Linear(2, feature_dim)
+        self.spatial_projection = nn.Linear(2, feature_dim)
+        self.query_attention = nn.MultiheadAttention(
+            feature_dim, num_heads, dropout=dropout, batch_first=True
+        )
+        self.output_norm = nn.LayerNorm(feature_dim)
+        nn.init.trunc_normal_(self.radial_queries, std=0.02)
+
+    @staticmethod
+    def _normalized_coordinates(height, width, device, dtype):
+        rows = torch.linspace(-1.0, 1.0, height, device=device, dtype=dtype)
+        cols = torch.linspace(-1.0, 1.0, width, device=device, dtype=dtype)
+        row_grid, col_grid = torch.meshgrid(rows, cols, indexing='ij')
+        return torch.stack((row_grid, col_grid), dim=-1).reshape(-1, 2)
+
+    def forward(self, uav_map):
+        if uav_map.dim() != 4 or uav_map.size(1) != self.feature_dim:
+            raise ValueError(
+                "Expected UAV map shaped [B, feature_dim, H, W], "
+                f"got {tuple(uav_map.shape)}"
+            )
+        batch_size, _, height, width = uav_map.shape
+        memory = uav_map.flatten(2).transpose(1, 2)
+        coordinates = self._normalized_coordinates(
+            height, width, uav_map.device, uav_map.dtype
+        )
+        memory = memory + self.spatial_projection(coordinates).unsqueeze(0)
+
+        angle_queries = self.angle_projection(
+            self.angle_basis.to(device=uav_map.device, dtype=uav_map.dtype)
+        ).view(1, 1, self.num_angle_bins, self.feature_dim)
+        queries = self.radial_queries.to(dtype=uav_map.dtype) + angle_queries
+        queries = queries.reshape(
+            1, self.num_radial_bins * self.num_angle_bins, self.feature_dim
+        ).expand(batch_size, -1, -1)
+        encoded, _ = self.query_attention(
+            queries, memory, memory, need_weights=False
+        )
+        encoded = self.output_norm(encoded + queries)
+        return encoded.reshape(
+            batch_size,
+            self.num_radial_bins,
+            self.num_angle_bins,
+            self.feature_dim,
+        ).permute(0, 3, 1, 2).contiguous()
+
+
+class SharedRadialAlignment(nn.Module):
+    """Map UAV-height and RST-radius features to a shared learned radial axis."""
+
+    def __init__(self, feature_dim=64, num_radial_bins=8, num_heads=4, dropout=0.1):
+        super().__init__()
+        if feature_dim % num_heads != 0:
+            raise ValueError("feature_dim must be divisible by num_heads")
+        self.feature_dim = feature_dim
+        self.num_radial_bins = num_radial_bins
+        self.virtual_queries = nn.Parameter(
+            torch.zeros(1, num_radial_bins, feature_dim)
+        )
+        self.radial_embedding = nn.Parameter(
+            torch.zeros(1, num_radial_bins, feature_dim)
+        )
+        self.uav_attention = nn.MultiheadAttention(
+            feature_dim, num_heads, dropout=dropout, batch_first=True
+        )
+        self.rst_attention = nn.MultiheadAttention(
+            feature_dim, num_heads, dropout=dropout, batch_first=True
+        )
+        self.uav_norm = nn.LayerNorm(feature_dim)
+        self.rst_norm = nn.LayerNorm(feature_dim)
+        nn.init.trunc_normal_(self.virtual_queries, std=0.02)
+        nn.init.trunc_normal_(self.radial_embedding, std=0.02)
+
+    def _align(self, feature, attention, output_norm):
+        batch_size, channels, radial_bins, angle_bins = feature.shape
+        if channels != self.feature_dim or radial_bins != self.num_radial_bins:
+            raise ValueError("Unexpected radial alignment feature shape")
+        memory = feature.permute(0, 3, 2, 1).reshape(
+            batch_size * angle_bins, radial_bins, channels
+        )
+        memory = memory + self.radial_embedding.to(dtype=feature.dtype)
+        queries = self.virtual_queries.to(dtype=feature.dtype).expand(
+            batch_size * angle_bins, -1, -1
+        )
+        aligned, _ = attention(queries, memory, memory, need_weights=False)
+        aligned = output_norm(aligned + queries)
+        return aligned.reshape(
+            batch_size, angle_bins, radial_bins, channels
+        ).permute(0, 3, 2, 1).contiguous()
+
+    def forward(self, uav_feature, rst_features):
+        aligned_uav = self._align(
+            uav_feature, self.uav_attention, self.uav_norm
+        )
+        batch_size, num_scales, channels, radial_bins, angle_bins = (
+            rst_features.shape
+        )
+        flat_rst = rst_features.reshape(
+            batch_size * num_scales, channels, radial_bins, angle_bins
+        )
+        aligned_rst = self._align(
+            flat_rst, self.rst_attention, self.rst_norm
+        ).reshape(
+            batch_size, num_scales, channels, radial_bins, angle_bins
+        )
+        return aligned_uav, aligned_rst
+
+
+class CyclicOrientationCorrelation(nn.Module):
+    """Build a full circular heading distribution from aligned view features."""
+
+    def __init__(self, num_angle_bins=72, orientation_temperature=0.1,
+                 scale_temperature=0.2):
+        super().__init__()
+        if orientation_temperature <= 0 or scale_temperature <= 0:
+            raise ValueError("Correlation temperatures must be positive")
+        self.num_angle_bins = num_angle_bins
+        self.orientation_temperature = orientation_temperature
+        self.scale_temperature = scale_temperature
+
+    def forward(self, uav_feature, rst_features):
+        if rst_features.size(-1) != self.num_angle_bins:
+            raise ValueError("RST angle dimension does not match num_angle_bins")
+        uav_feature = F.normalize(uav_feature, p=2, dim=1)
+        rst_features = F.normalize(rst_features, p=2, dim=2)
+        scores = []
+        for shift in range(self.num_angle_bins):
+            # Shift the UAV-relative direction sequence so logit k directly
+            # represents the candidate absolute heading theta_k.
+            shifted_uav = torch.roll(uav_feature, shifts=shift, dims=-1)
+            score = (
+                shifted_uav[:, None] * rst_features
+            ).sum(dim=2).mean(dim=(-2, -1))
+            scores.append(score)
+        scale_scores = torch.stack(scores, dim=-1)
+        logits = self.scale_temperature * torch.logsumexp(
+            scale_scores / self.scale_temperature, dim=1
+        )
+        probability = torch.softmax(
+            logits / self.orientation_temperature, dim=-1
+        )
+        return logits, probability, scale_scores
+
+
+class MSPCOCHeadingHead(nn.Module):
+    """Multi-scale position-conditioned orientation correlation head."""
+
+    def __init__(
+        self,
+        input_dim=256,
+        feature_dim=64,
+        num_radial_bins=8,
+        num_angle_bins=72,
+        crop_scales=(0.75, 1.0, 1.25),
+        base_radius=0.5,
+        num_heads=4,
+        dropout=0.1,
+        orientation_temperature=0.1,
+        scale_temperature=0.2,
+        gate_bias=-3.0,
+    ):
+        super().__init__()
+        self.num_angle_bins = num_angle_bins
+        projector = lambda: nn.Sequential(
+            nn.Conv2d(input_dim, feature_dim, kernel_size=1, bias=False),
+            nn.GroupNorm(8, feature_dim),
+            nn.GELU(),
+        )
+        self.rst_projector = projector()
+        self.uav_projector = projector()
+        self.polar_sampler = PositionConditionedPolarSampler(
+            num_radial_bins=num_radial_bins,
+            num_angle_bins=num_angle_bins,
+            crop_scales=crop_scales,
+            base_radius=base_radius,
+        )
+        self.uav_direction_encoder = UAVDirectionQueryEncoder(
+            feature_dim=feature_dim,
+            num_radial_bins=num_radial_bins,
+            num_angle_bins=num_angle_bins,
+            num_heads=num_heads,
+            dropout=dropout,
+        )
+        self.radial_alignment = SharedRadialAlignment(
+            feature_dim=feature_dim,
+            num_radial_bins=num_radial_bins,
+            num_heads=num_heads,
+            dropout=dropout,
+        )
+        self.correlation = CyclicOrientationCorrelation(
+            num_angle_bins=num_angle_bins,
+            orientation_temperature=orientation_temperature,
+            scale_temperature=scale_temperature,
+        )
+        angles = torch.arange(num_angle_bins, dtype=torch.float32)
+        angles = angles * (2.0 * math.pi / num_angle_bins)
+        self.register_buffer(
+            'heading_basis', torch.stack((angles.cos(), angles.sin()), dim=-1)
+        )
+        self.confidence_gate = nn.Sequential(
+            nn.Linear(3, 16),
+            nn.GELU(),
+            nn.Linear(16, 1),
+        )
+        nn.init.zeros_(self.confidence_gate[-1].weight)
+        nn.init.constant_(self.confidence_gate[-1].bias, gate_bias)
+
+    def forward(self, rst_maps, uav_map, position, base_heading):
+        batch_size, num_rst, channels, height, width = rst_maps.shape
+        if num_rst != 4:
+            raise ValueError("MS-PCOC requires exactly four RST maps")
+        projected_rst = self.rst_projector(
+            rst_maps.reshape(batch_size * num_rst, channels, height, width)
+        ).reshape(batch_size, num_rst, -1, height, width)
+        rst_mosaic = PositionConditionedPolarSampler.build_mosaic(projected_rst)
+        rst_polar = self.polar_sampler(rst_mosaic, position.detach())
+        projected_uav = self.uav_projector(uav_map)
+        uav_direction = self.uav_direction_encoder(projected_uav)
+        aligned_uav, aligned_rst = self.radial_alignment(
+            uav_direction, rst_polar
+        )
+        logits, probability, scale_scores = self.correlation(
+            aligned_uav, aligned_rst
+        )
+
+        basis = self.heading_basis.to(
+            device=probability.device, dtype=probability.dtype
+        )
+        raw_heading = probability @ basis
+        resultant = torch.linalg.vector_norm(raw_heading, dim=-1)
+        corr_heading = raw_heading / resultant.clamp_min(1e-6).unsqueeze(-1)
+        max_probability = probability.max(dim=-1).values
+        entropy = -(
+            probability * probability.clamp_min(1e-8).log()
+        ).sum(dim=-1) / math.log(self.num_angle_bins)
+        confidence = torch.stack(
+            (max_probability, 1.0 - entropy, resultant), dim=-1
+        )
+        gate = torch.sigmoid(self.confidence_gate(confidence))
+        base_heading = F.normalize(base_heading, p=2, dim=-1, eps=1e-6)
+        final_heading = F.normalize(
+            (1.0 - gate) * base_heading + gate * corr_heading,
+            p=2,
+            dim=-1,
+            eps=1e-6,
+        )
+        return final_heading, {
+            'orientation_logits': logits,
+            'orientation_probability': probability,
+            'scale_scores': scale_scores,
+            'correlation_heading': corr_heading,
+            'base_heading': base_heading,
+            'final_heading': final_heading,
+            'gate': gate,
+            'resultant': resultant,
+            'rst_polar': rst_polar,
+            'uav_direction': uav_direction,
+        }
 
 class PositionAngleRegressionSGM(nn.Module):
     def __init__(self, 
@@ -962,6 +1349,206 @@ class PARCASGM_v5a_H1(PARCASGM_v5a):
         )
 
 
+class PARCASGM_v5a_MSPCOC(PARCASGM_v5a):
+    """Experiment H2: learned cross-view orientation correlation."""
+
+    default_loss_type = 'mspcoc'
+    default_optimizer = 'AdamW'
+    default_learning_rate = 1e-4
+    requires_init_checkpoint = True
+    uses_heading_distribution_loss = True
+
+    def __init__(
+        self,
+        backbone_name='vgg16',
+        feature_dim=256,
+        coord_enc_dims=[16, 64, 256],
+        regressor_dims=[1024, 256, 64],
+        reduction_ratio=1,
+        num_clusters=4,
+        freeze_backbone=True,
+        partial_unfreeze=False,
+        add_patch_coord=True,
+        heading_feature_dim=64,
+        heading_radial_bins=8,
+        heading_angle_bins=72,
+        heading_crop_scales=(0.75, 1.0, 1.25),
+        heading_base_radius=0.5,
+        heading_num_heads=4,
+        heading_dropout=0.1,
+        heading_temperature=0.1,
+        heading_scale_temperature=0.2,
+        heading_gate_bias=-3.0,
+        heading_kappa=32.0,
+        heading_dist_weight=1.0,
+        heading_corr_weight=0.5,
+        heading_final_weight=0.5,
+        freeze_base=True,
+    ):
+        super().__init__(
+            backbone_name=backbone_name,
+            feature_dim=feature_dim,
+            coord_enc_dims=coord_enc_dims,
+            regressor_dims=regressor_dims,
+            reduction_ratio=reduction_ratio,
+            num_clusters=num_clusters,
+            freeze_backbone=freeze_backbone,
+            partial_unfreeze=partial_unfreeze,
+            add_patch_coord=add_patch_coord,
+        )
+        if heading_kappa <= 0:
+            raise ValueError("heading_kappa must be positive")
+        if min(
+            heading_dist_weight,
+            heading_corr_weight,
+            heading_final_weight,
+        ) < 0:
+            raise ValueError("MS-PCOC loss weights must be non-negative")
+
+        self.model_name = 'phr5_h2_mspcoc'
+        self.freeze_base = bool(freeze_base)
+        self.heading_kappa = float(heading_kappa)
+        self.heading_dist_weight = float(heading_dist_weight)
+        self.heading_corr_weight = float(heading_corr_weight)
+        self.heading_final_weight = float(heading_final_weight)
+        self.ms_pcoc_head = MSPCOCHeadingHead(
+            input_dim=feature_dim,
+            feature_dim=heading_feature_dim,
+            num_radial_bins=heading_radial_bins,
+            num_angle_bins=heading_angle_bins,
+            crop_scales=heading_crop_scales,
+            base_radius=heading_base_radius,
+            num_heads=heading_num_heads,
+            dropout=heading_dropout,
+            orientation_temperature=heading_temperature,
+            scale_temperature=heading_scale_temperature,
+            gate_bias=heading_gate_bias,
+        )
+        if self.freeze_base:
+            for name, parameter in self.named_parameters():
+                if not name.startswith('ms_pcoc_head.'):
+                    parameter.requires_grad = False
+
+    def train(self, mode=True):
+        super().train(mode)
+        if mode and self.freeze_base:
+            for name, module in self.named_children():
+                if name != 'ms_pcoc_head':
+                    module.eval()
+            self.ms_pcoc_head.train(True)
+        return self
+
+    def _official_forward_with_maps(self, patches):
+        batch_size = patches.size(0)
+        sgm_outputs = [self.sgm(patches[:, i]) for i in range(5)]
+        rst_descriptors = torch.stack(
+            [output['descriptor_flatten'] for output in sgm_outputs[:4]], dim=1
+        )
+        rst_maps = torch.stack(
+            [output['nl_feat'] for output in sgm_outputs[:4]], dim=1
+        )
+        uav_descriptor = sgm_outputs[4]['descriptor_flatten']
+        uav_map = sgm_outputs[4]['nl_feat']
+
+        known_coords = torch.tensor(
+            [[-1.0, -1.0], [-1.0, 1.0], [1.0, -1.0], [1.0, 1.0]],
+            dtype=uav_descriptor.dtype,
+            device=uav_descriptor.device,
+        )
+        coord_embs = self.coord_encoder(known_coords).unsqueeze(0).expand(
+            batch_size, -1, -1
+        )
+        pos_soft_prior = self.sim_pos_prior(uav_descriptor, rst_descriptors)
+        cross_attention_features = rst_descriptors
+        if self.add_patch_coord:
+            cross_attention_features = cross_attention_features + coord_embs
+        context = self.neighbors_cross_attn(
+            uav_descriptor, cross_attention_features
+        )
+        combined = torch.cat((uav_descriptor, context), dim=1)
+        position = self.pos_regressor(
+            torch.cat((combined, pos_soft_prior), dim=1)
+        )
+        base_heading = self.dir_regressor(combined)
+        return position, base_heading, rst_maps, uav_map
+
+    def forward(
+        self,
+        patches,
+        debug_dir='',
+        return_aux=False,
+        heading_position=None,
+    ):
+        if patches.dim() != 5 or patches.size(1) != 5:
+            raise ValueError(
+                f"Expected patches shaped [B, 5, C, H, W], got {tuple(patches.shape)}"
+            )
+        if self.freeze_base:
+            with torch.no_grad():
+                position, base_heading, rst_maps, uav_map = (
+                    self._official_forward_with_maps(patches)
+                )
+        else:
+            position, base_heading, rst_maps, uav_map = (
+                self._official_forward_with_maps(patches)
+            )
+        correlation_center = position if heading_position is None else heading_position
+        final_heading, auxiliary = self.ms_pcoc_head(
+            rst_maps,
+            uav_map,
+            correlation_center,
+            base_heading,
+        )
+        auxiliary['heading_position'] = correlation_center.detach()
+        if return_aux:
+            return position, final_heading, auxiliary
+        return position, final_heading
+
+    @staticmethod
+    def _wrapped_heading_loss(prediction, target):
+        prediction = F.normalize(prediction, p=2, dim=-1, eps=1e-6)
+        target = F.normalize(target, p=2, dim=-1, eps=1e-6)
+        cross = prediction[:, 0] * target[:, 1] - prediction[:, 1] * target[:, 0]
+        dot = (prediction * target).sum(dim=-1).clamp(-1.0, 1.0)
+        delta = torch.atan2(cross, dot)
+        return F.smooth_l1_loss(delta, torch.zeros_like(delta))
+
+    def compute_heading_losses(self, auxiliary, target_heading):
+        probability = auxiliary['orientation_probability'].float()
+        target_heading = F.normalize(
+            target_heading.float(), p=2, dim=-1, eps=1e-6
+        )
+        target_angle = torch.atan2(
+            target_heading[:, 1], target_heading[:, 0]
+        )
+        basis = self.ms_pcoc_head.heading_basis.float()
+        bin_angles = torch.atan2(basis[:, 1], basis[:, 0])
+        circular_offset = bin_angles.unsqueeze(0) - target_angle.unsqueeze(1)
+        soft_target = torch.softmax(
+            self.heading_kappa * torch.cos(circular_offset), dim=-1
+        )
+        distribution = -(
+            soft_target * probability.clamp_min(1e-8).log()
+        ).sum(dim=-1).mean()
+        correlation = self._wrapped_heading_loss(
+            auxiliary['correlation_heading'].float(), target_heading
+        )
+        final = self._wrapped_heading_loss(
+            auxiliary['final_heading'].float(), target_heading
+        )
+        total = (
+            self.heading_dist_weight * distribution
+            + self.heading_corr_weight * correlation
+            + self.heading_final_weight * final
+        )
+        return {
+            'distribution': distribution,
+            'correlation': correlation,
+            'final': final,
+            'total': total,
+        }
+
+
 class RSBlockDatasetPA_v3q(Dataset):
     """
     Remote sensing data processing class and its processing pipeline design
@@ -1262,6 +1849,25 @@ model_kwargs_par_ca_sgm_v5a_globalrst_attn = {
     'attention_temperature': 1.0,
 }
 
+model_kwargs_par_ca_sgm_v5a_mspcoc = {
+    **model_kwargs_par_ca_sgm_v5a,
+    'heading_feature_dim': 64,
+    'heading_radial_bins': 8,
+    'heading_angle_bins': 72,
+    'heading_crop_scales': (0.75, 1.0, 1.25),
+    'heading_base_radius': 0.5,
+    'heading_num_heads': 4,
+    'heading_dropout': 0.1,
+    'heading_temperature': 0.1,
+    'heading_scale_temperature': 0.2,
+    'heading_gate_bias': -3.0,
+    'heading_kappa': 32.0,
+    'heading_dist_weight': 1.0,
+    'heading_corr_weight': 0.5,
+    'heading_final_weight': 0.5,
+    'freeze_base': True,
+}
+
 
 """****************************************************************************
 *                                                                             *
@@ -1273,6 +1879,7 @@ MODEL_CLASS_DICT = {
     "PARCASGM_v5":          PARCASGM_v5,
     "PARCASGM_v5a":         PARCASGM_v5a,
     "PARCASGM_v5a_H1":      PARCASGM_v5a_H1,
+    "PARCASGM_v5a_MSPCOC":  PARCASGM_v5a_MSPCOC,
     "PARCASGM_v5a_GlobalRST": PARCASGM_v5a_GlobalRST,
     "PARCASGM_v5a_GlobalRST_PosPrior": PARCASGM_v5a_GlobalRST_PosPrior,
     "PARCASGM_v5a_GlobalRST_Quad": PARCASGM_v5a_GlobalRST_Quad,
@@ -1284,6 +1891,7 @@ MODEL_KEYWARDS_DICT = {
     "PARCASGM_v5":          model_kwargs_par_ca_sgm_v5a,
     "PARCASGM_v5a":         model_kwargs_par_ca_sgm_v5a,
     "PARCASGM_v5a_H1":      model_kwargs_par_ca_sgm_v5a,
+    "PARCASGM_v5a_MSPCOC":  model_kwargs_par_ca_sgm_v5a_mspcoc,
     "PARCASGM_v5a_GlobalRST": model_kwargs_par_ca_sgm_v5a_globalrst,
     "PARCASGM_v5a_GlobalRST_PosPrior": model_kwargs_par_ca_sgm_v5a_globalrst,
     "PARCASGM_v5a_GlobalRST_Quad": model_kwargs_par_ca_sgm_v5a_globalrst_quad,
