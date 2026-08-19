@@ -1898,6 +1898,7 @@ class PARCASGM_v5a_GPRVH(PARCASGM_v5a):
     model_name = 'phr5_h3d_gprvh'
     default_optimizer = 'AdamW'
     default_learning_rate = 1e-4
+    default_loss_type = 'gprvh'
     requires_init_checkpoint = True
     uses_heading_distribution_loss = True
     initialization_missing_prefixes = ('gprv_head.',)

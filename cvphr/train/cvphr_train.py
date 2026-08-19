@@ -221,6 +221,12 @@ def train_par(
             'Using MS-PCOC heading objective: von Mises distribution + '
             'wrapped correlation/final losses'
         )
+    elif loss_type == 'gprvh':
+        criterion = nn.SmoothL1Loss()
+        print(
+            'Using GPRV-H heading objective: joint pose volume + circular, '
+            'dual-phase, and opposite-direction losses'
+        )
     elif loss_type == 'smoothl1' or loss_type == 'pos_smoothl1' or loss_type == 'dir_smoothl1':
         criterion = nn.SmoothL1Loss()
         print(f'Using loss function: SmoothL1Loss(pos_weight={pos_weight}, dir_weight={dir_weight})')
@@ -467,9 +473,11 @@ def train_par(
                 epoch_heading_final += (
                     heading_losses['final'].item() * batch_size
                 )
-                epoch_heading_gate += (
-                    auxiliary['gate'].detach().float().mean().item() * batch_size
-                )
+                if 'gate' in auxiliary:
+                    epoch_heading_gate += (
+                        auxiliary['gate'].detach().float().mean().item()
+                        * batch_size
+                    )
             if uses_auxiliary_losses:
                 epoch_train_loss_quad += (
                     auxiliary_losses['quad'].item() * batch_size
@@ -589,9 +597,10 @@ def train_par(
                     epoch_val_heading_final += (
                         heading_losses['final'].item() * batch_size
                     )
-                    epoch_val_heading_gate += (
-                        auxiliary['gate'].float().mean().item() * batch_size
-                    )
+                    if 'gate' in auxiliary:
+                        epoch_val_heading_gate += (
+                            auxiliary['gate'].float().mean().item() * batch_size
+                        )
 
                 all_val_pos_pred.append(pos_pred.detach().cpu())
                 all_val_dir_pred.append(dir_pred.detach().cpu())

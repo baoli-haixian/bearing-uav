@@ -50,6 +50,7 @@ class ExperimentH3DTest(unittest.TestCase):
         self.assertIs(
             MODEL_CLASS_DICT['PARCASGM_v5a_GPRVH'], PARCASGM_v5a_GPRVH
         )
+        self.assertEqual(PARCASGM_v5a_GPRVH.default_loss_type, 'gprvh')
         head = GeometryPoseVolumeHeadingHead(
             input_dim=32,
             feature_dim=16,
