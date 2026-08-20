@@ -232,6 +232,9 @@ def test_par(dataset_dir,
     uses_heading_distribution_loss = bool(
         getattr(model, 'uses_heading_distribution_loss', False)
     )
+    uses_position_distribution_loss = bool(
+        getattr(model, 'uses_position_distribution_loss', False)
+    )
 
     # Load model weights
     # Use map_location to remap checkpoint device to current available device
@@ -276,7 +279,7 @@ def test_par(dataset_dir,
             B = patches.size(0)
 
             # Predict relative position and vector direction
-            if uses_heading_distribution_loss:
+            if uses_heading_distribution_loss or uses_position_distribution_loss:
                 pos_pred, dir_pred, auxiliary = model(
                     patches, return_aux=True
                 )
@@ -297,6 +300,10 @@ def test_par(dataset_dir,
                 loss = pos_weight * loss_pos + dir_weight * loss_dir
             elif loss_type in {'smoothl1', 'circular'}:
                 loss_pos = criterion(pos_pred, coords)
+                if uses_position_distribution_loss:
+                    loss_pos = loss_pos + model.compute_position_losses(
+                        auxiliary, coords
+                    )['total']
                 if heading_criterion is not None:
                     loss_dir = heading_criterion(dir_pred, agl_coords)
                 else:

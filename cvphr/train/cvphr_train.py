@@ -380,8 +380,13 @@ def train_par(
     uses_heading_distribution_loss = bool(
         getattr(raw_model, 'uses_heading_distribution_loss', False)
     )
+    uses_position_distribution_loss = bool(
+        getattr(raw_model, 'uses_position_distribution_loss', False)
+    )
     returns_loss_auxiliary = (
-        uses_auxiliary_losses or uses_heading_distribution_loss
+        uses_auxiliary_losses
+        or uses_heading_distribution_loss
+        or uses_position_distribution_loss
     )
 
     def _train_one_epoch(epoch):
@@ -417,6 +422,11 @@ def train_par(
                     pos_pred, dir_pred = model(patches)
 
                 loss_pos = criterion(pos_pred, coords)
+                if uses_position_distribution_loss:
+                    position_losses = raw_model.compute_position_losses(
+                        auxiliary, coords
+                    )
+                    loss_pos = loss_pos + position_losses['total']
                 if uses_heading_distribution_loss:
                     heading_losses = raw_model.compute_heading_losses(
                         auxiliary, agl_coords, target_position=coords
@@ -544,6 +554,11 @@ def train_par(
 
                 # 'smoothl1', 'huber': joint training, calculate loss directly in validation
                 loss_pos = criterion(pos_pred, coords)
+                if uses_position_distribution_loss:
+                    position_losses = raw_model.compute_position_losses(
+                        auxiliary, coords
+                    )
+                    loss_pos = loss_pos + position_losses['total']
                 if uses_heading_distribution_loss:
                     heading_losses = raw_model.compute_heading_losses(
                         auxiliary, agl_coords, target_position=coords

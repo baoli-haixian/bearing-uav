@@ -245,6 +245,206 @@ class RSTGlobalContextFusion(nn.Module):
         return fused_descriptors
 
 
+class MultiScaleRotationMarginalizedPositionHead(nn.Module):
+    """Dense RSB localization with rotation-marginalized multi-scale matching."""
+
+    def __init__(
+        self,
+        input_dim=256,
+        feature_dim=64,
+        num_rotations=16,
+        output_size=32,
+        scale_sizes=(16, 24, 32),
+        template_sizes=(6, 8, 10),
+        rotation_temperature=0.15,
+        heatmap_temperature=0.10,
+        gate_bias=-2.0,
+        refine_radius=0.125,
+    ):
+        super().__init__()
+        if num_rotations < 1 or output_size < 2:
+            raise ValueError("Rotation count and output size must be positive")
+        if len(scale_sizes) != len(template_sizes) or not scale_sizes:
+            raise ValueError("Each dense matching scale requires a template size")
+        if any(k >= size for size, k in zip(scale_sizes, template_sizes)):
+            raise ValueError("Template sizes must be smaller than RST scale sizes")
+        if rotation_temperature <= 0 or heatmap_temperature <= 0:
+            raise ValueError("Dense position temperatures must be positive")
+
+        self.num_rotations = int(num_rotations)
+        self.output_size = int(output_size)
+        self.scale_sizes = tuple(int(size) for size in scale_sizes)
+        self.template_sizes = tuple(int(size) for size in template_sizes)
+        self.rotation_temperature = float(rotation_temperature)
+        self.heatmap_temperature = float(heatmap_temperature)
+        self.refine_radius = float(refine_radius)
+
+        self.rst_projector = nn.Sequential(
+            nn.Conv2d(input_dim, feature_dim, kernel_size=1, bias=False),
+            nn.GroupNorm(8, feature_dim),
+            nn.GELU(),
+            nn.Conv2d(feature_dim, feature_dim, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(8, feature_dim),
+            nn.GELU(),
+        )
+        self.uav_projector = nn.Sequential(
+            nn.Conv2d(input_dim, feature_dim, kernel_size=1, bias=False),
+            nn.GroupNorm(8, feature_dim),
+            nn.GELU(),
+        )
+        self.scale_logits = nn.Parameter(torch.zeros(len(self.scale_sizes)))
+        quality_dim = 4
+        self.refiner = nn.Sequential(
+            nn.Linear(feature_dim * 3 + quality_dim + 2, 128),
+            nn.GELU(),
+            nn.Linear(128, 2),
+        )
+        self.gate = nn.Sequential(
+            nn.Linear(quality_dim + 2, 32),
+            nn.GELU(),
+            nn.Linear(32, 1),
+        )
+        nn.init.zeros_(self.refiner[-1].weight)
+        nn.init.zeros_(self.refiner[-1].bias)
+        nn.init.zeros_(self.gate[-1].weight)
+        nn.init.constant_(self.gate[-1].bias, gate_bias)
+
+        angles = torch.arange(self.num_rotations, dtype=torch.float32)
+        angles = angles * (2.0 * math.pi / self.num_rotations)
+        self.register_buffer('rotation_angles', angles)
+        coords = torch.linspace(-1.0, 1.0, self.output_size)
+        yy, xx = torch.meshgrid(coords, coords, indexing='ij')
+        self.register_buffer('position_grid', torch.stack((xx, yy), dim=-1))
+
+    @staticmethod
+    def _build_mosaic(rst_maps):
+        return RSTGlobalContextFusion.build_mosaic(rst_maps)
+
+    def _rotation_bank(self, feature, template_size):
+        feature = F.adaptive_avg_pool2d(feature, (template_size, template_size))
+        batch_size = feature.size(0)
+        angles = self.rotation_angles.to(device=feature.device, dtype=feature.dtype)
+        cosine, sine = angles.cos(), angles.sin()
+        theta = torch.zeros(
+            self.num_rotations, 2, 3, device=feature.device, dtype=feature.dtype
+        )
+        theta[:, 0, 0] = cosine
+        theta[:, 0, 1] = -sine
+        theta[:, 1, 0] = sine
+        theta[:, 1, 1] = cosine
+        theta = theta.unsqueeze(0).expand(batch_size, -1, -1, -1).reshape(-1, 2, 3)
+        expanded = feature[:, None].expand(
+            -1, self.num_rotations, -1, -1, -1
+        ).reshape(-1, feature.size(1), template_size, template_size)
+        grid = F.affine_grid(theta, expanded.shape, align_corners=False)
+        rotated = F.grid_sample(
+            expanded, grid, mode='bilinear', padding_mode='zeros', align_corners=False
+        )
+        return rotated.reshape(
+            batch_size, self.num_rotations, feature.size(1), template_size, template_size
+        )
+
+    def _align_response(self, response, map_size, template_size):
+        """Resample valid correlation centers onto the common [-1, 1] RSB grid."""
+        response_size = map_size - template_size + 1
+        target = self.position_grid.to(device=response.device, dtype=response.dtype)
+        mosaic_center = target / 2.0
+        pixel_center = (mosaic_center + 1.0) * map_size / 2.0
+        response_index = pixel_center - template_size / 2.0
+        source_grid = (response_index + 0.5) * 2.0 / response_size - 1.0
+        source_grid = source_grid.unsqueeze(0).expand(response.size(0), -1, -1, -1)
+        aligned = F.grid_sample(
+            response, source_grid, mode='bilinear', padding_mode='border',
+            align_corners=False,
+        )
+        return aligned
+
+    def _correlate_scale(self, rst_feature, uav_feature, map_size, template_size):
+        rst_scaled = F.interpolate(
+            rst_feature, size=(map_size, map_size), mode='bilinear', align_corners=False
+        )
+        templates = self._rotation_bank(uav_feature, template_size)
+        batch_size, rotations = templates.shape[:2]
+        patches = F.unfold(rst_scaled, kernel_size=template_size)
+        patches = F.normalize(patches, p=2, dim=1, eps=1e-6)
+        templates = templates.flatten(2)
+        templates = F.normalize(templates, p=2, dim=-1, eps=1e-6)
+        scores = torch.einsum('brd,bdn->brn', templates, patches)
+        response_size = map_size - template_size + 1
+        scores = scores.reshape(batch_size, rotations, response_size, response_size)
+        return self._align_response(scores, map_size, template_size)
+
+    def _soft_argmax(self, probability):
+        grid = self.position_grid.to(device=probability.device, dtype=probability.dtype)
+        return torch.einsum('bhw,hwc->bc', probability, grid)
+
+    def forward(self, rst_maps, uav_map, base_position):
+        if rst_maps.dim() != 5 or rst_maps.size(1) != 4:
+            raise ValueError("Dense positioning requires four RST feature maps")
+        rst_feature = self.rst_projector(self._build_mosaic(rst_maps))
+        uav_feature = self.uav_projector(uav_map)
+        scale_volumes = [
+            self._correlate_scale(rst_feature, uav_feature, size, template)
+            for size, template in zip(self.scale_sizes, self.template_sizes)
+        ]
+        scale_volume = torch.stack(scale_volumes, dim=1)
+        scale_weights = torch.softmax(self.scale_logits, dim=0)
+        volume = torch.einsum('s,bsrhw->brhw', scale_weights, scale_volume)
+        position_logits = self.rotation_temperature * torch.logsumexp(
+            volume / self.rotation_temperature, dim=1
+        )
+        probability = torch.softmax(
+            position_logits.flatten(1) / self.heatmap_temperature, dim=-1
+        ).reshape_as(position_logits)
+        coarse_position = self._soft_argmax(probability)
+
+        flat_probability = probability.flatten(1)
+        top_values = flat_probability.topk(k=2, dim=-1).values
+        entropy = -(
+            flat_probability * flat_probability.clamp_min(1e-8).log()
+        ).sum(dim=-1) / math.log(flat_probability.size(-1))
+        scale_positions = []
+        for scores in scale_volumes:
+            logits = self.rotation_temperature * torch.logsumexp(
+                scores / self.rotation_temperature, dim=1
+            )
+            scale_probability = torch.softmax(
+                logits.flatten(1) / self.heatmap_temperature, dim=-1
+            ).reshape_as(logits)
+            scale_positions.append(self._soft_argmax(scale_probability))
+        scale_positions = torch.stack(scale_positions, dim=1)
+        scale_spread = scale_positions.std(dim=1, unbiased=False).norm(dim=-1)
+        quality = torch.stack(
+            (top_values[:, 0], top_values[:, 0] - top_values[:, 1],
+             1.0 - entropy, scale_spread), dim=-1
+        )
+
+        grid_center = (coarse_position / 2.0).view(-1, 1, 1, 2)
+        sampled_rst = F.grid_sample(
+            rst_feature, grid_center, mode='bilinear', padding_mode='border',
+            align_corners=False,
+        ).flatten(1)
+        uav_summary = F.adaptive_avg_pool2d(uav_feature, 1).flatten(1)
+        feature_delta = sampled_rst - uav_summary
+        refine_input = torch.cat(
+            (sampled_rst, uav_summary, feature_delta, quality, coarse_position), dim=-1
+        )
+        offset = torch.tanh(self.refiner(refine_input)) * self.refine_radius
+        dense_position = (coarse_position + offset).clamp(-1.0, 1.0)
+        gate_input = torch.cat((quality, dense_position - base_position.detach()), dim=-1)
+        gate = torch.sigmoid(self.gate(gate_input))
+        final_position = base_position + gate * (dense_position - base_position)
+        return final_position, {
+            'position_logits': position_logits,
+            'position_probability': probability,
+            'coarse_position': coarse_position,
+            'dense_position': dense_position,
+            'position_gate': gate,
+            'scale_weights': scale_weights,
+            'scale_positions': scale_positions,
+        }
+
+
 class PositionConditionedPolarSampler(nn.Module):
     """Sample multi-scale polar RST features around a predicted RSB position."""
 
@@ -1515,6 +1715,165 @@ class PARCASGM_v5a_GlobalRST_PosPrior(PARCASGM_v5a_GlobalRST):
         return pos_pred, dir_pred
 
 
+class PARCASGM_v5a_MSRDCP_P5(PARCASGM_v5a_GlobalRST_PosPrior):
+    """P5 stage 1: frozen experiment F plus dense probabilistic positioning."""
+
+    model_name = 'phr5_msrdcp_p5_s1'
+    requires_init_checkpoint = True
+    initialization_missing_prefixes = ('dense_position_head.',)
+    uses_position_distribution_loss = True
+    default_learning_rate = 1e-4
+    default_optimizer = 'AdamW'
+
+    def __init__(
+        self,
+        dense_feature_dim=64,
+        dense_num_rotations=16,
+        dense_output_size=32,
+        dense_scale_sizes=(16, 24, 32),
+        dense_template_sizes=(6, 8, 10),
+        dense_rotation_temperature=0.15,
+        dense_heatmap_temperature=0.10,
+        dense_gate_bias=-2.0,
+        dense_refine_radius=0.125,
+        dense_heatmap_sigma=0.08,
+        dense_heatmap_loss_weight=0.30,
+        dense_coarse_loss_weight=0.20,
+        dense_refine_loss_weight=0.10,
+        freeze_base=True,
+        **kwargs,
+    ):
+        feature_dim = kwargs.get('feature_dim', 256)
+        super().__init__(**kwargs)
+        if dense_heatmap_sigma <= 0:
+            raise ValueError("Dense heatmap sigma must be positive")
+        if min(
+            dense_heatmap_loss_weight,
+            dense_coarse_loss_weight,
+            dense_refine_loss_weight,
+        ) < 0:
+            raise ValueError("Dense position loss weights must be non-negative")
+        self.model_name = 'phr5_msrdcp_p5_s1'
+        self.freeze_base = bool(freeze_base)
+        self.dense_heatmap_sigma = float(dense_heatmap_sigma)
+        self.dense_heatmap_loss_weight = float(dense_heatmap_loss_weight)
+        self.dense_coarse_loss_weight = float(dense_coarse_loss_weight)
+        self.dense_refine_loss_weight = float(dense_refine_loss_weight)
+        if self.freeze_base:
+            for parameter in self.parameters():
+                parameter.requires_grad = False
+        self.dense_position_head = MultiScaleRotationMarginalizedPositionHead(
+            input_dim=feature_dim,
+            feature_dim=dense_feature_dim,
+            num_rotations=dense_num_rotations,
+            output_size=dense_output_size,
+            scale_sizes=dense_scale_sizes,
+            template_sizes=dense_template_sizes,
+            rotation_temperature=dense_rotation_temperature,
+            heatmap_temperature=dense_heatmap_temperature,
+            gate_bias=dense_gate_bias,
+            refine_radius=dense_refine_radius,
+        )
+
+    def train(self, mode=True):
+        super().train(mode)
+        if mode and self.freeze_base:
+            for name, module in self.named_children():
+                if name != 'dense_position_head':
+                    module.eval()
+            self.dense_position_head.train(True)
+        return self
+
+    def _experiment_f_forward_with_maps(self, patches):
+        batch_size = patches.size(0)
+        sgm_outputs = [self.sgm(patches[:, index]) for index in range(5)]
+        rst_descriptors = torch.stack(
+            [output['descriptor_flatten'] for output in sgm_outputs[:4]], dim=1
+        )
+        rst_maps = torch.stack(
+            [output['nl_feat'] for output in sgm_outputs[:4]], dim=1
+        )
+        global_descriptors = self.rst_global_fusion(rst_maps, rst_descriptors)
+        uav_descriptor = sgm_outputs[4]['descriptor_flatten']
+        uav_map = sgm_outputs[4]['nl_feat']
+        known_coords = torch.tensor(
+            [[-1.0, -1.0], [-1.0, 1.0], [1.0, -1.0], [1.0, 1.0]],
+            dtype=uav_descriptor.dtype,
+            device=uav_descriptor.device,
+        )
+        coord_embs = self.coord_encoder(known_coords).unsqueeze(0).expand(
+            batch_size, -1, -1
+        )
+        prior = self.sim_pos_prior(uav_descriptor, global_descriptors)
+        cross_attention_features = rst_descriptors
+        if self.add_patch_coord:
+            cross_attention_features = cross_attention_features + coord_embs
+        context = self.neighbors_cross_attn(
+            uav_descriptor, cross_attention_features
+        )
+        combined = torch.cat((uav_descriptor, context), dim=1)
+        base_position = self.pos_regressor(torch.cat((combined, prior), dim=1))
+        base_heading = self.dir_regressor(combined)
+        return base_position, base_heading, rst_maps, uav_map
+
+    def forward(self, patches, debug_dir='', return_aux=False):
+        if patches.dim() != 5 or patches.size(1) != 5:
+            raise ValueError(
+                f"Expected patches shaped [B, 5, C, H, W], got {tuple(patches.shape)}"
+            )
+        if self.freeze_base:
+            with torch.no_grad():
+                base_position, heading, rst_maps, uav_map = (
+                    self._experiment_f_forward_with_maps(patches)
+                )
+        else:
+            base_position, heading, rst_maps, uav_map = (
+                self._experiment_f_forward_with_maps(patches)
+            )
+        position, auxiliary = self.dense_position_head(
+            rst_maps, uav_map, base_position
+        )
+        auxiliary['base_position'] = base_position
+        if return_aux:
+            return position, heading, auxiliary
+        return position, heading
+
+    def compute_position_losses(self, auxiliary, target_position):
+        target_position = target_position.float()
+        probability = auxiliary['position_probability'].float()
+        grid = self.dense_position_head.position_grid.to(
+            device=target_position.device, dtype=target_position.dtype
+        )
+        squared_distance = (
+            grid[None] - target_position[:, None, None, :]
+        ).square().sum(dim=-1)
+        target_heatmap = torch.softmax(
+            -squared_distance.flatten(1) / (2.0 * self.dense_heatmap_sigma ** 2),
+            dim=-1,
+        ).reshape_as(probability)
+        heatmap = F.kl_div(
+            probability.clamp_min(1e-8).log(), target_heatmap,
+            reduction='batchmean',
+        )
+        coarse = F.smooth_l1_loss(
+            auxiliary['coarse_position'].float(), target_position
+        )
+        refine = F.smooth_l1_loss(
+            auxiliary['dense_position'].float(), target_position
+        )
+        total = (
+            self.dense_heatmap_loss_weight * heatmap
+            + self.dense_coarse_loss_weight * coarse
+            + self.dense_refine_loss_weight * refine
+        )
+        return {
+            'heatmap': heatmap,
+            'coarse': coarse,
+            'refine': refine,
+            'total': total,
+        }
+
+
 class PARCASGM_v5a_GlobalRST_Aux(PARCASGM_v5a_GlobalRST):
     """Experiment E: global RST fusion with quadrant and geometry constraints."""
 
@@ -2553,6 +2912,24 @@ model_kwargs_par_ca_sgm_v5a_globalrst_posprior_gprvh_s1 = {
     },
 }
 
+model_kwargs_par_ca_sgm_v5a_msrdcp_p5 = {
+    **model_kwargs_par_ca_sgm_v5a_globalrst,
+    'dense_feature_dim': 64,
+    'dense_num_rotations': 16,
+    'dense_output_size': 32,
+    'dense_scale_sizes': (16, 24, 32),
+    'dense_template_sizes': (6, 8, 10),
+    'dense_rotation_temperature': 0.15,
+    'dense_heatmap_temperature': 0.10,
+    'dense_gate_bias': -2.0,
+    'dense_refine_radius': 0.125,
+    'dense_heatmap_sigma': 0.08,
+    'dense_heatmap_loss_weight': 0.30,
+    'dense_coarse_loss_weight': 0.20,
+    'dense_refine_loss_weight': 0.10,
+    'freeze_base': True,
+}
+
 
 """****************************************************************************
 *                                                                             *
@@ -2567,6 +2944,7 @@ MODEL_CLASS_DICT = {
     "PARCASGM_v5a_MSPCOC":  PARCASGM_v5a_MSPCOC,
     "PARCASGM_v5a_GPRVH":   PARCASGM_v5a_GPRVH,
     "PARCASGM_v5a_GlobalRST_PosPrior_GPRVH": PARCASGM_v5a_GlobalRST_PosPrior_GPRVH,
+    "PARCASGM_v5a_MSRDCP_P5": PARCASGM_v5a_MSRDCP_P5,
     "PARCASGM_v5a_GlobalRST": PARCASGM_v5a_GlobalRST,
     "PARCASGM_v5a_GlobalRST_PosPrior": PARCASGM_v5a_GlobalRST_PosPrior,
     "PARCASGM_v5a_GlobalRST_Quad": PARCASGM_v5a_GlobalRST_Quad,
@@ -2581,6 +2959,7 @@ MODEL_KEYWARDS_DICT = {
     "PARCASGM_v5a_MSPCOC":  model_kwargs_par_ca_sgm_v5a_mspcoc,
     "PARCASGM_v5a_GPRVH":   model_kwargs_par_ca_sgm_v5a_gprvh,
     "PARCASGM_v5a_GlobalRST_PosPrior_GPRVH": model_kwargs_par_ca_sgm_v5a_globalrst_posprior_gprvh_s1,
+    "PARCASGM_v5a_MSRDCP_P5": model_kwargs_par_ca_sgm_v5a_msrdcp_p5,
     "PARCASGM_v5a_GlobalRST": model_kwargs_par_ca_sgm_v5a_globalrst,
     "PARCASGM_v5a_GlobalRST_PosPrior": model_kwargs_par_ca_sgm_v5a_globalrst,
     "PARCASGM_v5a_GlobalRST_Quad": model_kwargs_par_ca_sgm_v5a_globalrst_quad,
