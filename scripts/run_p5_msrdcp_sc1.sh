@@ -12,7 +12,7 @@ esac
 
 cd "$PROJECT_DIR"
 test -f "$F_CHECKPOINT"
-test -f Bearing_UAV_90K/metadata/metadata.csv
+test -f Bearing_UAV_90K/c4m_254k_96bc_b15_s100_v3d/metadata/metadata.csv
 mkdir -p log/c4ma
 
 export CUDA_VISIBLE_DEVICES="$GPU_ID"

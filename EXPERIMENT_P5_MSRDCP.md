@@ -23,7 +23,7 @@ source /home/xuly/.conda/envs/bearing_env/bin/activate
 The project expects:
 
 ```text
-Bearing_UAV_90K/metadata/metadata.csv
+Bearing_UAV_90K/c4m_254k_96bc_b15_s100_v3d/metadata/metadata.csv
 Bearing_UAV_90K/citya/...
 Bearing_UAV_90K/cityb/...
 Bearing_UAV_90K/cityc/...
@@ -75,4 +75,3 @@ P5 against the same experiment F split using Recall@1, LSR@15, HSR@15, and MLE.
 Continue to joint fine-tuning only if P5 improves MLE or Recall@1 without a
 material LSR/HSR regression. Joint fine-tuning should start from the P5 best
 checkpoint with a lower learning rate (`1e-5`); it is a separate experiment.
-
