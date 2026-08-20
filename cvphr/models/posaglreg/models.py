@@ -2134,6 +2134,76 @@ class PARCASGM_v5a_GPRVH(PARCASGM_v5a):
         }
 
 
+class PARCASGM_v5a_GlobalRST_PosPrior_GPRVH(PARCASGM_v5a_GPRVH):
+    """Stage 1: frozen experiment F localization with a trainable GPRV-H head."""
+
+    model_name = 'phr5_globalrst_f_gprvh_s1'
+    initialization_missing_prefixes = ('gprv_head.',)
+
+    def __init__(
+        self,
+        global_token_grid_size=4,
+        global_num_heads=8,
+        global_feedforward_dim=512,
+        global_dropout=0.1,
+        **kwargs,
+    ):
+        feature_dim = kwargs.get('feature_dim', 256)
+        num_clusters = kwargs.get('num_clusters', 4)
+        super().__init__(**kwargs)
+        self.rst_global_fusion = RSTGlobalContextFusion(
+            feature_dim=feature_dim,
+            descriptor_dim=feature_dim * num_clusters,
+            token_grid_size=global_token_grid_size,
+            num_heads=global_num_heads,
+            feedforward_dim=global_feedforward_dim,
+            dropout=global_dropout,
+        )
+        if self.freeze_base:
+            for parameter in self.rst_global_fusion.parameters():
+                parameter.requires_grad = False
+
+    def _official_forward_with_maps(self, patches):
+        batch_size = patches.size(0)
+        sgm_outputs = [self.sgm(patches[:, index]) for index in range(5)]
+        rst_descriptors = torch.stack(
+            [output['descriptor_flatten'] for output in sgm_outputs[:4]], dim=1
+        )
+        rst_maps = torch.stack(
+            [output['nl_feat'] for output in sgm_outputs[:4]], dim=1
+        )
+        global_rst_descriptors = self.rst_global_fusion(
+            rst_maps, rst_descriptors
+        )
+        uav_descriptor = sgm_outputs[4]['descriptor_flatten']
+        uav_map = sgm_outputs[4]['nl_feat']
+
+        known_coords = torch.tensor(
+            [[-1.0, -1.0], [-1.0, 1.0], [1.0, -1.0], [1.0, 1.0]],
+            dtype=uav_descriptor.dtype,
+            device=uav_descriptor.device,
+        )
+        coord_embs = self.coord_encoder(known_coords).unsqueeze(0).expand(
+            batch_size, -1, -1
+        )
+        pos_soft_prior = self.sim_pos_prior(
+            uav_descriptor, global_rst_descriptors
+        )
+        # Preserve experiment F: global context changes only the PSG prior.
+        cross_attention_features = rst_descriptors
+        if self.add_patch_coord:
+            cross_attention_features = cross_attention_features + coord_embs
+        context = self.neighbors_cross_attn(
+            uav_descriptor, cross_attention_features
+        )
+        combined = torch.cat((uav_descriptor, context), dim=1)
+        position = self.pos_regressor(
+            torch.cat((combined, pos_soft_prior), dim=1)
+        )
+        base_heading = self.dir_regressor(combined)
+        return position, base_heading, rst_maps, uav_map
+
+
 class RSBlockDatasetPA_v3q(Dataset):
     """
     Remote sensing data processing class and its processing pipeline design
@@ -2474,6 +2544,15 @@ model_kwargs_par_ca_sgm_v5a_gprvh = {
     'freeze_base': True,
 }
 
+model_kwargs_par_ca_sgm_v5a_globalrst_posprior_gprvh_s1 = {
+    **model_kwargs_par_ca_sgm_v5a_globalrst,
+    **{
+        key: value
+        for key, value in model_kwargs_par_ca_sgm_v5a_gprvh.items()
+        if key not in model_kwargs_par_ca_sgm_v5a
+    },
+}
+
 
 """****************************************************************************
 *                                                                             *
@@ -2487,6 +2566,7 @@ MODEL_CLASS_DICT = {
     "PARCASGM_v5a_H1":      PARCASGM_v5a_H1,
     "PARCASGM_v5a_MSPCOC":  PARCASGM_v5a_MSPCOC,
     "PARCASGM_v5a_GPRVH":   PARCASGM_v5a_GPRVH,
+    "PARCASGM_v5a_GlobalRST_PosPrior_GPRVH": PARCASGM_v5a_GlobalRST_PosPrior_GPRVH,
     "PARCASGM_v5a_GlobalRST": PARCASGM_v5a_GlobalRST,
     "PARCASGM_v5a_GlobalRST_PosPrior": PARCASGM_v5a_GlobalRST_PosPrior,
     "PARCASGM_v5a_GlobalRST_Quad": PARCASGM_v5a_GlobalRST_Quad,
@@ -2500,6 +2580,7 @@ MODEL_KEYWARDS_DICT = {
     "PARCASGM_v5a_H1":      model_kwargs_par_ca_sgm_v5a,
     "PARCASGM_v5a_MSPCOC":  model_kwargs_par_ca_sgm_v5a_mspcoc,
     "PARCASGM_v5a_GPRVH":   model_kwargs_par_ca_sgm_v5a_gprvh,
+    "PARCASGM_v5a_GlobalRST_PosPrior_GPRVH": model_kwargs_par_ca_sgm_v5a_globalrst_posprior_gprvh_s1,
     "PARCASGM_v5a_GlobalRST": model_kwargs_par_ca_sgm_v5a_globalrst,
     "PARCASGM_v5a_GlobalRST_PosPrior": model_kwargs_par_ca_sgm_v5a_globalrst,
     "PARCASGM_v5a_GlobalRST_Quad": model_kwargs_par_ca_sgm_v5a_globalrst_quad,
