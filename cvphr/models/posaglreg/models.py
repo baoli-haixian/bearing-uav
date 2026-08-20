@@ -2563,6 +2563,33 @@ class PARCASGM_v5a_GlobalRST_PosPrior_GPRVH(PARCASGM_v5a_GPRVH):
         return position, base_heading, rst_maps, uav_map
 
 
+class PARCASGM_v5a_GlobalRST_PosPrior_GPRVH_Joint100(
+    PARCASGM_v5a_GlobalRST_PosPrior_GPRVH
+):
+    """Joint-100: train experiment F and H3-D together from initialization."""
+
+    model_name = 'phr5_globalrst_f_gprvh_joint100'
+    requires_init_checkpoint = False
+    default_optimizer = 'Adam'
+    default_learning_rate = 5e-5
+
+    def __init__(self, heading_loss_warmup_epochs=10, **kwargs):
+        if heading_loss_warmup_epochs < 0:
+            raise ValueError("Heading loss warmup epochs must be non-negative")
+        kwargs['freeze_base'] = False
+        super().__init__(**kwargs)
+        self.model_name = type(self).model_name
+        self.heading_loss_warmup_epochs = int(heading_loss_warmup_epochs)
+
+    def heading_loss_scale(self, epoch):
+        if self.heading_loss_warmup_epochs == 0:
+            return 1.0
+        return min(
+            1.0,
+            float(epoch + 1) / float(self.heading_loss_warmup_epochs),
+        )
+
+
 class RSBlockDatasetPA_v3q(Dataset):
     """
     Remote sensing data processing class and its processing pipeline design
@@ -2912,6 +2939,12 @@ model_kwargs_par_ca_sgm_v5a_globalrst_posprior_gprvh_s1 = {
     },
 }
 
+model_kwargs_par_ca_sgm_v5a_globalrst_posprior_gprvh_joint100 = {
+    **model_kwargs_par_ca_sgm_v5a_globalrst_posprior_gprvh_s1,
+    'freeze_base': False,
+    'heading_loss_warmup_epochs': 10,
+}
+
 model_kwargs_par_ca_sgm_v5a_msrdcp_p5 = {
     **model_kwargs_par_ca_sgm_v5a_globalrst,
     'dense_feature_dim': 64,
@@ -2944,6 +2977,7 @@ MODEL_CLASS_DICT = {
     "PARCASGM_v5a_MSPCOC":  PARCASGM_v5a_MSPCOC,
     "PARCASGM_v5a_GPRVH":   PARCASGM_v5a_GPRVH,
     "PARCASGM_v5a_GlobalRST_PosPrior_GPRVH": PARCASGM_v5a_GlobalRST_PosPrior_GPRVH,
+    "PARCASGM_v5a_GlobalRST_PosPrior_GPRVH_Joint100": PARCASGM_v5a_GlobalRST_PosPrior_GPRVH_Joint100,
     "PARCASGM_v5a_MSRDCP_P5": PARCASGM_v5a_MSRDCP_P5,
     "PARCASGM_v5a_GlobalRST": PARCASGM_v5a_GlobalRST,
     "PARCASGM_v5a_GlobalRST_PosPrior": PARCASGM_v5a_GlobalRST_PosPrior,
@@ -2959,6 +2993,7 @@ MODEL_KEYWARDS_DICT = {
     "PARCASGM_v5a_MSPCOC":  model_kwargs_par_ca_sgm_v5a_mspcoc,
     "PARCASGM_v5a_GPRVH":   model_kwargs_par_ca_sgm_v5a_gprvh,
     "PARCASGM_v5a_GlobalRST_PosPrior_GPRVH": model_kwargs_par_ca_sgm_v5a_globalrst_posprior_gprvh_s1,
+    "PARCASGM_v5a_GlobalRST_PosPrior_GPRVH_Joint100": model_kwargs_par_ca_sgm_v5a_globalrst_posprior_gprvh_joint100,
     "PARCASGM_v5a_MSRDCP_P5": model_kwargs_par_ca_sgm_v5a_msrdcp_p5,
     "PARCASGM_v5a_GlobalRST": model_kwargs_par_ca_sgm_v5a_globalrst,
     "PARCASGM_v5a_GlobalRST_PosPrior": model_kwargs_par_ca_sgm_v5a_globalrst,

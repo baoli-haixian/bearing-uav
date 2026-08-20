@@ -393,6 +393,11 @@ def train_par(
         """Single epoch training logic."""
         nonlocal global_step
         nonlocal history
+        heading_loss_scale = (
+            raw_model.heading_loss_scale(epoch)
+            if hasattr(raw_model, 'heading_loss_scale')
+            else 1.0
+        )
 
         model.train()
         epoch_train_loss = 0.0
@@ -437,7 +442,10 @@ def train_par(
                 else:
                     loss_dir = criterion(dir_pred, agl_coords)
                 pos_weight, dir_weight = pa_loss_weight
-                loss_pose = pos_weight * loss_pos + dir_weight * loss_dir
+                loss_pose = (
+                    pos_weight * loss_pos
+                    + dir_weight * heading_loss_scale * loss_dir
+                )
                 loss = loss_pose
                 if uses_auxiliary_losses:
                     auxiliary_losses = raw_model.compute_auxiliary_losses(
@@ -638,6 +646,11 @@ def train_par(
 
     for epoch in range(start_epoch, num_epochs):
         print(f"Epoch {epoch + 1}/{num_epochs} [Train]")
+        heading_loss_scale = (
+            raw_model.heading_loss_scale(epoch)
+            if hasattr(raw_model, 'heading_loss_scale')
+            else 1.0
+        )
 
         # Training phase
         start_time = time.time()
@@ -706,7 +719,7 @@ def train_par(
         train_loss_dir = train_loss_dir / len(train_loader.dataset)
         train_pose_loss = (
             pa_loss_weight[0] * train_loss_pos
-            + pa_loss_weight[1] * train_loss_dir
+            + pa_loss_weight[1] * heading_loss_scale * train_loss_dir
         )
         train_loss_quad = train_loss_quad / len(train_loader.dataset)
         train_loss_attention = train_loss_attention / len(train_loader.dataset)
@@ -735,6 +748,7 @@ def train_par(
         val_heading_final /= len(val_loader.dataset)
         val_heading_gate /= len(val_loader.dataset)
         history.setdefault('train_pose_loss', []).append(train_pose_loss)
+        history.setdefault('heading_loss_scale', []).append(heading_loss_scale)
         history.setdefault('train_loss_quad', []).append(train_loss_quad)
         history.setdefault('train_loss_attention', []).append(train_loss_attention)
         history.setdefault('train_loss_quad_weighted', []).append(
@@ -780,6 +794,7 @@ def train_par(
         # Record to tensorboard
         writer.add_scalar('Loss/train', train_loss, epoch)
         writer.add_scalar('Loss/train_pose', train_pose_loss, epoch)
+        writer.add_scalar('Loss/heading_loss_scale', heading_loss_scale, epoch)
         if uses_auxiliary_losses:
             writer.add_scalar('Loss/train_quad', train_loss_quad, epoch)
             writer.add_scalar(
