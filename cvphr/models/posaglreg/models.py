@@ -245,6 +245,109 @@ class RSTGlobalContextFusion(nn.Module):
         return fused_descriptors
 
 
+class LocalCandidatePositionRefiner(nn.Module):
+    """Refine a coarse RSB position with local RST-to-UAV feature matching."""
+
+    def __init__(
+        self,
+        input_dim=256,
+        feature_dim=64,
+        radius=0.15,
+        temperature=0.1,
+        gate_bias=-2.0,
+    ):
+        super().__init__()
+        if radius <= 0:
+            raise ValueError("LCPR radius must be positive")
+        if temperature <= 0:
+            raise ValueError("LCPR temperature must be positive")
+
+        self.radius = float(radius)
+        self.temperature = float(temperature)
+        self.rst_projection = nn.Sequential(
+            nn.Conv2d(input_dim, feature_dim, kernel_size=1, bias=False),
+            nn.GroupNorm(8, feature_dim),
+            nn.GELU(),
+        )
+        self.uav_projection = nn.Sequential(
+            nn.Conv2d(input_dim, feature_dim, kernel_size=1, bias=False),
+            nn.GroupNorm(8, feature_dim),
+            nn.GELU(),
+        )
+        self.gate = nn.Sequential(
+            nn.Linear(feature_dim * 2 + 4, 32),
+            nn.GELU(),
+            nn.Linear(32, 1),
+        )
+        nn.init.zeros_(self.gate[-1].weight)
+        nn.init.constant_(self.gate[-1].bias, gate_bias)
+
+        axis = torch.tensor((-1.0, 0.0, 1.0))
+        yy, xx = torch.meshgrid(axis, axis, indexing='ij')
+        offsets = torch.stack((xx, yy), dim=-1).reshape(-1, 2) * self.radius
+        self.register_buffer('candidate_offsets', offsets)
+
+    def forward(self, rst_maps, uav_map, coarse_position):
+        if rst_maps.dim() != 5 or rst_maps.size(1) != 4:
+            raise ValueError("LCPR requires four RST feature maps")
+        if uav_map.dim() != 4 or coarse_position.shape != (rst_maps.size(0), 2):
+            raise ValueError("Invalid UAV map or coarse position shape for LCPR")
+
+        rst_mosaic = RSTGlobalContextFusion.build_mosaic(rst_maps)
+        rst_feature = self.rst_projection(rst_mosaic)
+        uav_query = F.adaptive_avg_pool2d(
+            self.uav_projection(uav_map), 1
+        ).flatten(1)
+
+        offsets = self.candidate_offsets.to(
+            device=coarse_position.device, dtype=coarse_position.dtype
+        )
+        candidate_positions = (
+            coarse_position[:, None, :] + offsets[None, :, :]
+        ).clamp(-1.0, 1.0)
+        effective_offsets = candidate_positions - coarse_position[:, None, :]
+
+        # The 2x2 RST mosaic spans twice the normalized target search region.
+        sampling_grid = (candidate_positions / 2.0).unsqueeze(2)
+        candidate_features = F.grid_sample(
+            rst_feature,
+            sampling_grid,
+            mode='bilinear',
+            padding_mode='border',
+            align_corners=False,
+        ).squeeze(-1).transpose(1, 2)
+
+        normalized_query = F.normalize(uav_query, p=2, dim=-1, eps=1e-6)
+        normalized_candidates = F.normalize(
+            candidate_features, p=2, dim=-1, eps=1e-6
+        )
+        candidate_logits = torch.einsum(
+            'bd,bnd->bn', normalized_query, normalized_candidates
+        ) / self.temperature
+        candidate_weights = torch.softmax(candidate_logits, dim=-1)
+        position_delta = torch.einsum(
+            'bn,bnd->bd', candidate_weights, effective_offsets
+        )
+        matched_feature = torch.einsum(
+            'bn,bnd->bd', candidate_weights, candidate_features
+        )
+
+        gate_input = torch.cat(
+            (uav_query, matched_feature, coarse_position, position_delta), dim=-1
+        )
+        gate = torch.sigmoid(self.gate(gate_input))
+        refined_position = (
+            coarse_position + gate * position_delta
+        ).clamp(-1.0, 1.0)
+        return refined_position, {
+            'coarse_position': coarse_position,
+            'candidate_positions': candidate_positions,
+            'candidate_weights': candidate_weights,
+            'position_delta': position_delta,
+            'refinement_gate': gate,
+        }
+
+
 class MultiScaleRotationMarginalizedPositionHead(nn.Module):
     """Dense RSB localization with rotation-marginalized multi-scale matching."""
 
@@ -1715,6 +1818,106 @@ class PARCASGM_v5a_GlobalRST_PosPrior(PARCASGM_v5a_GlobalRST):
         return pos_pred, dir_pred
 
 
+class PARCASGM_v5a_GlobalRST_PosPrior_LCPR1(
+    PARCASGM_v5a_GlobalRST_PosPrior
+):
+    """Joint-100 experiment: Experiment F plus local position refinement."""
+
+    model_name = 'phr5_globalrst_f_lcpr1_joint100'
+
+    def __init__(
+        self,
+        lcpr_feature_dim=64,
+        lcpr_radius=0.15,
+        lcpr_temperature=0.1,
+        lcpr_gate_bias=-2.0,
+        **kwargs,
+    ):
+        feature_dim = kwargs.get('feature_dim', 256)
+        super().__init__(**kwargs)
+        self.model_name = 'phr5_globalrst_f_lcpr1_joint100'
+        self.local_position_refiner = LocalCandidatePositionRefiner(
+            input_dim=feature_dim,
+            feature_dim=lcpr_feature_dim,
+            radius=lcpr_radius,
+            temperature=lcpr_temperature,
+            gate_bias=lcpr_gate_bias,
+        )
+
+    def forward(
+        self,
+        patches,
+        debug_dir='',
+        return_aux=False,
+        attention_temperature=1.0,
+    ):
+        if patches.dim() != 5 or patches.size(1) != 5:
+            raise ValueError(
+                f"Expected patches shaped [B, 5, C, H, W], got {tuple(patches.shape)}"
+            )
+
+        batch_size = patches.size(0)
+        sgm_outputs = [self.sgm(patches[:, index]) for index in range(5)]
+        original_rst_descriptors = torch.stack(
+            [output['descriptor_flatten'] for output in sgm_outputs[:4]], dim=1
+        )
+        rst_maps = torch.stack(
+            [output['nl_feat'] for output in sgm_outputs[:4]], dim=1
+        )
+        fusion_output = self.rst_global_fusion(
+            rst_maps, original_rst_descriptors, return_aux=return_aux
+        )
+        if return_aux:
+            global_rst_descriptors, auxiliary = fusion_output
+        else:
+            global_rst_descriptors = fusion_output
+
+        uav_descriptor = sgm_outputs[4]['descriptor_flatten']
+        uav_map = sgm_outputs[4]['nl_feat']
+        known_coords = torch.tensor(
+            [[-1.0, -1.0], [-1.0, 1.0], [1.0, -1.0], [1.0, 1.0]],
+            dtype=uav_descriptor.dtype,
+            device=uav_descriptor.device,
+        )
+        coord_embs = self.coord_encoder(known_coords).unsqueeze(0).expand(
+            batch_size, -1, -1
+        )
+
+        prior_output = self.sim_pos_prior(
+            uav_descriptor,
+            global_rst_descriptors,
+            temperature=attention_temperature,
+            return_weights=return_aux,
+        )
+        if return_aux:
+            position_prior, attention_weights = prior_output
+            auxiliary['attention_weights'] = attention_weights
+            auxiliary['position_prior'] = position_prior
+            auxiliary['global_rst_descriptors'] = global_rst_descriptors
+        else:
+            position_prior = prior_output
+
+        cross_attention_features = original_rst_descriptors
+        if self.add_patch_coord:
+            cross_attention_features = cross_attention_features + coord_embs
+        context = self.neighbors_cross_attn(
+            uav_descriptor, cross_attention_features
+        )
+        combined = torch.cat((uav_descriptor, context), dim=1)
+        coarse_position = self.pos_regressor(
+            torch.cat((combined, position_prior), dim=1)
+        )
+        heading = self.dir_regressor(combined)
+        position, lcpr_auxiliary = self.local_position_refiner(
+            rst_maps, uav_map, coarse_position
+        )
+
+        if return_aux:
+            auxiliary.update(lcpr_auxiliary)
+            return position, heading, auxiliary
+        return position, heading
+
+
 class PARCASGM_v5a_MSRDCP_P5(PARCASGM_v5a_GlobalRST_PosPrior):
     """P5 stage 1: frozen experiment F plus dense probabilistic positioning."""
 
@@ -2963,6 +3166,14 @@ model_kwargs_par_ca_sgm_v5a_msrdcp_p5 = {
     'freeze_base': True,
 }
 
+model_kwargs_par_ca_sgm_v5a_globalrst_posprior_lcpr1 = {
+    **model_kwargs_par_ca_sgm_v5a_globalrst,
+    'lcpr_feature_dim': 64,
+    'lcpr_radius': 0.15,
+    'lcpr_temperature': 0.1,
+    'lcpr_gate_bias': -2.0,
+}
+
 
 """****************************************************************************
 *                                                                             *
@@ -2978,6 +3189,7 @@ MODEL_CLASS_DICT = {
     "PARCASGM_v5a_GPRVH":   PARCASGM_v5a_GPRVH,
     "PARCASGM_v5a_GlobalRST_PosPrior_GPRVH": PARCASGM_v5a_GlobalRST_PosPrior_GPRVH,
     "PARCASGM_v5a_GlobalRST_PosPrior_GPRVH_Joint100": PARCASGM_v5a_GlobalRST_PosPrior_GPRVH_Joint100,
+    "PARCASGM_v5a_GlobalRST_PosPrior_LCPR1": PARCASGM_v5a_GlobalRST_PosPrior_LCPR1,
     "PARCASGM_v5a_MSRDCP_P5": PARCASGM_v5a_MSRDCP_P5,
     "PARCASGM_v5a_GlobalRST": PARCASGM_v5a_GlobalRST,
     "PARCASGM_v5a_GlobalRST_PosPrior": PARCASGM_v5a_GlobalRST_PosPrior,
@@ -2994,6 +3206,7 @@ MODEL_KEYWARDS_DICT = {
     "PARCASGM_v5a_GPRVH":   model_kwargs_par_ca_sgm_v5a_gprvh,
     "PARCASGM_v5a_GlobalRST_PosPrior_GPRVH": model_kwargs_par_ca_sgm_v5a_globalrst_posprior_gprvh_s1,
     "PARCASGM_v5a_GlobalRST_PosPrior_GPRVH_Joint100": model_kwargs_par_ca_sgm_v5a_globalrst_posprior_gprvh_joint100,
+    "PARCASGM_v5a_GlobalRST_PosPrior_LCPR1": model_kwargs_par_ca_sgm_v5a_globalrst_posprior_lcpr1,
     "PARCASGM_v5a_MSRDCP_P5": model_kwargs_par_ca_sgm_v5a_msrdcp_p5,
     "PARCASGM_v5a_GlobalRST": model_kwargs_par_ca_sgm_v5a_globalrst,
     "PARCASGM_v5a_GlobalRST_PosPrior": model_kwargs_par_ca_sgm_v5a_globalrst,
