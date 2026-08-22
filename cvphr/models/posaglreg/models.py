@@ -1,6 +1,7 @@
 # Bearing-UAV model.
 import os
 import math
+import time
 import cv2
 import json
 import warnings
@@ -2834,13 +2835,25 @@ class RSBlockDatasetPA_v3q(Dataset):
         return len(self.df)
 
     @staticmethod
-    def load_cvimg_to_rgb_pil(path: str) -> Image.Image:
-        """Read image with cv2 and convert to RGB PIL.Image with fault tolerance."""
-        img = cv2.imread(path)
-        if img is None:
-            raise FileNotFoundError(f"Fail to read image: {path}")
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        return Image.fromarray(img)
+    def load_cvimg_to_rgb_pil(path: str, max_attempts: int = 8) -> Image.Image:
+        """Read an image, retrying transient failures from network filesystems."""
+        last_error = "cv2.imread returned None"
+        for attempt in range(max_attempts):
+            try:
+                img = cv2.imread(path, cv2.IMREAD_COLOR)
+                if img is not None:
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    return Image.fromarray(img)
+            except (cv2.error, OSError) as error:
+                last_error = repr(error)
+
+            if attempt + 1 < max_attempts:
+                time.sleep(min(0.25 * (2 ** attempt), 2.0))
+
+        raise FileNotFoundError(
+            f"Fail to read image after {max_attempts} attempts: {path}; "
+            f"last_error={last_error}"
+        )
 
     def prepare_patch(self, path: str, is_uav: bool) -> torch.Tensor:
         """
