@@ -2909,6 +2909,71 @@ class PARCASGM_v5a_PRMC_H1(PARCASGM_v5a):
         }
 
 
+class PARCASGM_v5a_GlobalRST_PosPrior_PRMC_H1(PARCASGM_v5a_PRMC_H1):
+    """Experiment F position branch plus the parallel P-RMC heading head."""
+
+    model_name = 'phr5_f_h1_prmc'
+
+    def __init__(
+        self,
+        *args,
+        global_token_grid_size=4,
+        global_num_heads=8,
+        global_feedforward_dim=512,
+        global_dropout=0.1,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.model_name = type(self).model_name
+        descriptor_dim = self.feature_dim * self.num_clusters
+        self.rst_global_fusion = RSTGlobalContextFusion(
+            feature_dim=self.feature_dim,
+            descriptor_dim=descriptor_dim,
+            token_grid_size=global_token_grid_size,
+            num_heads=global_num_heads,
+            feedforward_dim=global_feedforward_dim,
+            dropout=global_dropout,
+        )
+
+    def _position_forward_with_maps(self, patches):
+        batch_size = patches.size(0)
+        sgm_outputs = [self.sgm(patches[:, index]) for index in range(5)]
+        original_rst_descriptors = torch.stack(
+            [output['descriptor_flatten'] for output in sgm_outputs[:4]], dim=1
+        )
+        rst_maps = torch.stack(
+            [output['nl_feat'] for output in sgm_outputs[:4]], dim=1
+        )
+        uav_descriptor = sgm_outputs[4]['descriptor_flatten']
+        uav_map = sgm_outputs[4]['nl_feat']
+
+        # Match experiment F exactly: GlobalRST contributes only to PSG.
+        global_rst_descriptors = self.rst_global_fusion(
+            rst_maps, original_rst_descriptors
+        )
+        pos_soft_prior = self.sim_pos_prior(
+            uav_descriptor, global_rst_descriptors
+        )
+
+        known_coords = uav_descriptor.new_tensor(
+            [[-1.0, -1.0], [-1.0, 1.0], [1.0, -1.0], [1.0, 1.0]]
+        )
+        coord_embs = self.coord_encoder(known_coords).unsqueeze(0).expand(
+            batch_size, -1, -1
+        )
+        official_ca_features = original_rst_descriptors
+        if self.add_patch_coord:
+            official_ca_features = official_ca_features + coord_embs
+        official_context = self.neighbors_cross_attn(
+            uav_descriptor, official_ca_features
+        )
+        combined = torch.cat((uav_descriptor, official_context), dim=1)
+        position = self.pos_regressor(
+            torch.cat((combined, pos_soft_prior), dim=1)
+        )
+        return position, rst_maps, uav_map
+
+
 class PARCASGM_v5a_MSPCOC(PARCASGM_v5a):
     """Experiment H2: learned cross-view orientation correlation."""
 
@@ -3806,6 +3871,15 @@ model_kwargs_par_ca_sgm_v5a_prmc_h1 = {
     'heading_detach_shared': False,
 }
 
+model_kwargs_par_ca_sgm_v5a_f_prmc_h1 = {
+    **model_kwargs_par_ca_sgm_v5a_globalrst,
+    **{
+        key: value
+        for key, value in model_kwargs_par_ca_sgm_v5a_prmc_h1.items()
+        if key not in model_kwargs_par_ca_sgm_v5a
+    },
+}
+
 model_kwargs_par_ca_sgm_v5a_gprvh = {
     **model_kwargs_par_ca_sgm_v5a,
     'heading_feature_dim': 64,
@@ -3880,6 +3954,7 @@ MODEL_CLASS_DICT = {
     "PARCASGM_v5a":         PARCASGM_v5a,
     "PARCASGM_v5a_H1":      PARCASGM_v5a_H1,
     "PARCASGM_v5a_PRMC_H1": PARCASGM_v5a_PRMC_H1,
+    "PARCASGM_v5a_GlobalRST_PosPrior_PRMC_H1": PARCASGM_v5a_GlobalRST_PosPrior_PRMC_H1,
     "PARCASGM_v5a_MSPCOC":  PARCASGM_v5a_MSPCOC,
     "PARCASGM_v5a_GPRVH":   PARCASGM_v5a_GPRVH,
     "PARCASGM_v5a_GlobalRST_PosPrior_GPRVH": PARCASGM_v5a_GlobalRST_PosPrior_GPRVH,
@@ -3899,6 +3974,7 @@ MODEL_KEYWARDS_DICT = {
     "PARCASGM_v5a":         model_kwargs_par_ca_sgm_v5a,
     "PARCASGM_v5a_H1":      model_kwargs_par_ca_sgm_v5a,
     "PARCASGM_v5a_PRMC_H1": model_kwargs_par_ca_sgm_v5a_prmc_h1,
+    "PARCASGM_v5a_GlobalRST_PosPrior_PRMC_H1": model_kwargs_par_ca_sgm_v5a_f_prmc_h1,
     "PARCASGM_v5a_MSPCOC":  model_kwargs_par_ca_sgm_v5a_mspcoc,
     "PARCASGM_v5a_GPRVH":   model_kwargs_par_ca_sgm_v5a_gprvh,
     "PARCASGM_v5a_GlobalRST_PosPrior_GPRVH": model_kwargs_par_ca_sgm_v5a_globalrst_posprior_gprvh_s1,
