@@ -227,6 +227,12 @@ def train_par(
             'Using GPRV-H heading objective: joint pose volume + circular, '
             'dual-phase, and opposite-direction losses'
         )
+    elif loss_type == 'prmc':
+        criterion = nn.SmoothL1Loss()
+        print(
+            'Using P-RMC heading objective: SmoothL1 heading vector + '
+            'von Mises rotation-distribution loss'
+        )
     elif loss_type == 'smoothl1' or loss_type == 'pos_smoothl1' or loss_type == 'dir_smoothl1':
         criterion = nn.SmoothL1Loss()
         print(f'Using loss function: SmoothL1Loss(pos_weight={pos_weight}, dir_weight={dir_weight})')

@@ -71,6 +71,190 @@ class UnitL2Normalize(nn.Module):
     def forward(self, vector):
         return F.normalize(vector, p=2, dim=-1, eps=self.eps)
 
+
+class ParallelRotationMarginalizedHeadingHead(nn.Module):
+    """Estimate heading by globally matching rotated UAV feature templates."""
+
+    def __init__(
+        self,
+        input_dim=256,
+        feature_dim=64,
+        spatial_size=8,
+        num_rotations=36,
+        translation_temperature=0.2,
+        orientation_temperature=0.1,
+    ):
+        super().__init__()
+        if feature_dim <= 0 or spatial_size <= 1 or num_rotations < 4:
+            raise ValueError("P-RMC dimensions and rotation count must be positive")
+        if translation_temperature <= 0 or orientation_temperature <= 0:
+            raise ValueError("P-RMC temperatures must be positive")
+
+        self.feature_dim = int(feature_dim)
+        self.spatial_size = int(spatial_size)
+        self.num_rotations = int(num_rotations)
+        self.translation_temperature = float(translation_temperature)
+        self.orientation_temperature = float(orientation_temperature)
+
+        def projector():
+            return nn.Sequential(
+                nn.Conv2d(input_dim, feature_dim, kernel_size=1, bias=False),
+                nn.GroupNorm(8, feature_dim),
+                nn.GELU(),
+                nn.Conv2d(
+                    feature_dim,
+                    feature_dim,
+                    kernel_size=3,
+                    padding=1,
+                    groups=feature_dim,
+                    bias=False,
+                ),
+                nn.GELU(),
+            )
+
+        self.rst_projector = projector()
+        self.uav_projector = projector()
+
+        angles = torch.arange(num_rotations, dtype=torch.float32)
+        angles = angles * (2.0 * math.pi / num_rotations)
+        self.register_buffer('rotation_angles', angles)
+        self.register_buffer(
+            'heading_basis', torch.stack((angles.cos(), angles.sin()), dim=-1)
+        )
+
+    @staticmethod
+    def build_mosaic(rst_maps):
+        return RSTGlobalContextFusion.build_mosaic(rst_maps)
+
+    def _rotation_bank(self, feature):
+        batch_size = feature.size(0)
+        angles = self.rotation_angles.to(device=feature.device, dtype=feature.dtype)
+        cosine, sine = angles.cos(), angles.sin()
+        matrices = torch.zeros(
+            self.num_rotations, 2, 3, device=feature.device, dtype=feature.dtype
+        )
+        # affine_grid maps output coordinates back into the input feature map.
+        matrices[:, 0, 0] = cosine
+        matrices[:, 0, 1] = -sine
+        matrices[:, 1, 0] = sine
+        matrices[:, 1, 1] = cosine
+        matrices = matrices.unsqueeze(0).expand(batch_size, -1, -1, -1)
+        matrices = matrices.reshape(batch_size * self.num_rotations, 2, 3)
+
+        expanded = feature[:, None].expand(
+            -1, self.num_rotations, -1, -1, -1
+        ).reshape(
+            batch_size * self.num_rotations,
+            feature.size(1),
+            feature.size(2),
+            feature.size(3),
+        )
+        grid = F.affine_grid(matrices, expanded.shape, align_corners=False)
+        rotated = F.grid_sample(
+            expanded,
+            grid,
+            mode='bilinear',
+            padding_mode='zeros',
+            align_corners=False,
+        ).reshape(
+            batch_size,
+            self.num_rotations,
+            feature.size(1),
+            feature.size(2),
+            feature.size(3),
+        )
+
+        validity = torch.ones(
+            batch_size * self.num_rotations,
+            1,
+            feature.size(2),
+            feature.size(3),
+            device=feature.device,
+            dtype=feature.dtype,
+        )
+        rotated_validity = F.grid_sample(
+            validity,
+            grid,
+            mode='bilinear',
+            padding_mode='zeros',
+            align_corners=False,
+        ).reshape(
+            batch_size,
+            self.num_rotations,
+            1,
+            feature.size(2),
+            feature.size(3),
+        )
+        return rotated, rotated_validity
+
+    def _normalized_correlation(self, mosaic, templates, validity):
+        window_size = templates.size(-1)
+        windows = F.unfold(mosaic, kernel_size=window_size, stride=1)
+        batch_size, _, num_windows = windows.shape
+        response_size = mosaic.size(-1) - window_size + 1
+        if response_size <= 0 or response_size ** 2 != num_windows:
+            raise ValueError("P-RMC requires square RST maps larger than the UAV template")
+
+        templates = templates.flatten(2)
+        mask = validity.expand(-1, -1, self.feature_dim, -1, -1).flatten(2)
+        numerator = torch.einsum('bkd,bdn->bkn', templates * mask, windows)
+        template_norm = (templates.square() * mask).sum(dim=-1).clamp_min(1e-8).sqrt()
+        window_norm = torch.einsum(
+            'bkd,bdn->bkn', mask, windows.square()
+        ).clamp_min(1e-8).sqrt()
+        scores = numerator / (template_norm.unsqueeze(-1) * window_norm)
+        return scores.reshape(
+            batch_size, self.num_rotations, response_size, response_size
+        )
+
+    def forward(self, rst_maps, uav_map):
+        if rst_maps.dim() != 5 or rst_maps.size(1) != 4:
+            raise ValueError("P-RMC requires four RST feature maps")
+        if uav_map.dim() != 4 or rst_maps.size(0) != uav_map.size(0):
+            raise ValueError("P-RMC UAV and RST feature batches must match")
+
+        batch_size, num_rst, channels, height, width = rst_maps.shape
+        projected_rst = self.rst_projector(
+            rst_maps.reshape(batch_size * num_rst, channels, height, width)
+        )
+        projected_rst = F.adaptive_avg_pool2d(
+            projected_rst, (self.spatial_size, self.spatial_size)
+        ).reshape(
+            batch_size,
+            num_rst,
+            self.feature_dim,
+            self.spatial_size,
+            self.spatial_size,
+        )
+        rst_mosaic = self.build_mosaic(projected_rst)
+        projected_uav = F.adaptive_avg_pool2d(
+            self.uav_projector(uav_map),
+            (self.spatial_size, self.spatial_size),
+        )
+        templates, validity = self._rotation_bank(projected_uav)
+        response = self._normalized_correlation(rst_mosaic, templates, validity)
+
+        spatial_logits = response.flatten(2)
+        orientation_logits = self.translation_temperature * torch.logsumexp(
+            spatial_logits / self.translation_temperature, dim=-1
+        )
+        orientation_probability = torch.softmax(
+            orientation_logits / self.orientation_temperature, dim=-1
+        )
+        basis = self.heading_basis.to(
+            device=orientation_probability.device,
+            dtype=orientation_probability.dtype,
+        )
+        raw_heading = orientation_probability @ basis
+        heading = F.normalize(raw_heading, p=2, dim=-1, eps=1e-6)
+        return heading, {
+            'response': response,
+            'orientation_logits': orientation_logits,
+            'orientation_probability': orientation_probability,
+            'final_heading': heading,
+            'resultant': raw_heading.norm(dim=-1),
+        }
+
 class SimilarityPositionPrior(nn.Module):
     def __init__(self, feat_dim):
         super().__init__()
@@ -2253,6 +2437,152 @@ class PARCASGM_v5a_H1(PARCASGM_v5a):
         )
 
 
+class PARCASGM_v5a_PRMC_H1(PARCASGM_v5a):
+    """H1-P-RMC: an independent parallel rotation-correlation heading head."""
+
+    model_name = 'phr5_h1_prmc_parallel'
+    default_loss_type = 'prmc'
+    uses_heading_distribution_loss = True
+
+    def __init__(
+        self,
+        backbone_name='vgg16',
+        feature_dim=256,
+        coord_enc_dims=[16, 64, 256],
+        regressor_dims=[1024, 256, 64],
+        reduction_ratio=1,
+        num_clusters=4,
+        freeze_backbone=True,
+        partial_unfreeze=False,
+        add_patch_coord=True,
+        heading_feature_dim=64,
+        heading_spatial_size=8,
+        heading_num_rotations=36,
+        heading_translation_temperature=0.2,
+        heading_orientation_temperature=0.1,
+        heading_kappa=20.0,
+        heading_distribution_weight=0.1,
+        heading_vector_weight=1.0,
+        heading_detach_shared=False,
+    ):
+        super().__init__(
+            backbone_name=backbone_name,
+            feature_dim=feature_dim,
+            coord_enc_dims=coord_enc_dims,
+            regressor_dims=regressor_dims,
+            reduction_ratio=reduction_ratio,
+            num_clusters=num_clusters,
+            freeze_backbone=freeze_backbone,
+            partial_unfreeze=partial_unfreeze,
+            add_patch_coord=add_patch_coord,
+        )
+        if heading_kappa <= 0:
+            raise ValueError("P-RMC heading kappa must be positive")
+        if min(heading_distribution_weight, heading_vector_weight) < 0:
+            raise ValueError("P-RMC loss weights must be non-negative")
+
+        self.model_name = type(self).model_name
+        self.heading_kappa = float(heading_kappa)
+        self.heading_distribution_weight = float(heading_distribution_weight)
+        self.heading_vector_weight = float(heading_vector_weight)
+        self.heading_detach_shared = bool(heading_detach_shared)
+        # P-RMC replaces the official direction regressor instead of consuming
+        # or fusing its output. Keep the parameters for checkpoint compatibility.
+        for parameter in self.dir_regressor.parameters():
+            parameter.requires_grad = False
+        self.prmc_head = ParallelRotationMarginalizedHeadingHead(
+            input_dim=feature_dim,
+            feature_dim=heading_feature_dim,
+            spatial_size=heading_spatial_size,
+            num_rotations=heading_num_rotations,
+            translation_temperature=heading_translation_temperature,
+            orientation_temperature=heading_orientation_temperature,
+        )
+
+    def _position_forward_with_maps(self, patches):
+        batch_size = patches.size(0)
+        sgm_outputs = [self.sgm(patches[:, index]) for index in range(5)]
+        rst_descriptors = torch.stack(
+            [output['descriptor_flatten'] for output in sgm_outputs[:4]], dim=1
+        )
+        rst_maps = torch.stack(
+            [output['nl_feat'] for output in sgm_outputs[:4]], dim=1
+        )
+        uav_descriptor = sgm_outputs[4]['descriptor_flatten']
+        uav_map = sgm_outputs[4]['nl_feat']
+
+        known_coords = torch.tensor(
+            [[-1.0, -1.0], [-1.0, 1.0], [1.0, -1.0], [1.0, 1.0]],
+            dtype=uav_descriptor.dtype,
+            device=uav_descriptor.device,
+        )
+        coord_embs = self.coord_encoder(known_coords).unsqueeze(0).expand(
+            batch_size, -1, -1
+        )
+        pos_soft_prior = self.sim_pos_prior(uav_descriptor, rst_descriptors)
+        cross_attention_features = rst_descriptors
+        if self.add_patch_coord:
+            cross_attention_features = cross_attention_features + coord_embs
+        context = self.neighbors_cross_attn(
+            uav_descriptor, cross_attention_features
+        )
+        combined = torch.cat((uav_descriptor, context), dim=1)
+        position = self.pos_regressor(
+            torch.cat((combined, pos_soft_prior), dim=1)
+        )
+        return position, rst_maps, uav_map
+
+    def forward(self, patches, debug_dir='', return_aux=False):
+        if patches.dim() != 5 or patches.size(1) != 5:
+            raise ValueError(
+                f"Expected patches shaped [B, 5, C, H, W], got {tuple(patches.shape)}"
+            )
+        position, rst_maps, uav_map = self._position_forward_with_maps(patches)
+        if self.heading_detach_shared:
+            rst_maps = rst_maps.detach()
+            uav_map = uav_map.detach()
+        heading, auxiliary = self.prmc_head(rst_maps, uav_map)
+        if return_aux:
+            return position, heading, auxiliary
+        return position, heading
+
+    def compute_heading_losses(
+        self, auxiliary, target_heading, target_position=None
+    ):
+        del target_position
+        probability = auxiliary['orientation_probability'].float()
+        target_heading = F.normalize(
+            target_heading.float(), p=2, dim=-1, eps=1e-6
+        )
+        target_angle = torch.atan2(target_heading[:, 1], target_heading[:, 0])
+        basis = self.prmc_head.heading_basis.float()
+        bin_angles = torch.atan2(basis[:, 1], basis[:, 0])
+        circular_offset = bin_angles.unsqueeze(0) - target_angle.unsqueeze(1)
+        soft_target = torch.softmax(
+            self.heading_kappa * torch.cos(circular_offset), dim=-1
+        )
+        distribution = -(
+            soft_target * probability.clamp_min(1e-8).log()
+        ).sum(dim=-1).mean()
+        final_heading = F.normalize(
+            auxiliary['final_heading'].float(), p=2, dim=-1, eps=1e-6
+        )
+        vector = F.smooth_l1_loss(final_heading, target_heading)
+        correlation = (
+            1.0 - (final_heading * target_heading).sum(dim=-1)
+        ).mean()
+        total = (
+            self.heading_vector_weight * vector
+            + self.heading_distribution_weight * distribution
+        )
+        return {
+            'distribution': distribution,
+            'correlation': correlation,
+            'final': vector,
+            'total': total,
+        }
+
+
 class PARCASGM_v5a_MSPCOC(PARCASGM_v5a):
     """Experiment H2: learned cross-view orientation correlation."""
 
@@ -3125,6 +3455,19 @@ model_kwargs_par_ca_sgm_v5a_mspcoc = {
     'freeze_base': True,
 }
 
+model_kwargs_par_ca_sgm_v5a_prmc_h1 = {
+    **model_kwargs_par_ca_sgm_v5a,
+    'heading_feature_dim': 64,
+    'heading_spatial_size': 8,
+    'heading_num_rotations': 36,
+    'heading_translation_temperature': 0.2,
+    'heading_orientation_temperature': 0.1,
+    'heading_kappa': 20.0,
+    'heading_distribution_weight': 0.1,
+    'heading_vector_weight': 1.0,
+    'heading_detach_shared': False,
+}
+
 model_kwargs_par_ca_sgm_v5a_gprvh = {
     **model_kwargs_par_ca_sgm_v5a,
     'heading_feature_dim': 64,
@@ -3198,6 +3541,7 @@ MODEL_CLASS_DICT = {
     "PARCASGM_v5":          PARCASGM_v5,
     "PARCASGM_v5a":         PARCASGM_v5a,
     "PARCASGM_v5a_H1":      PARCASGM_v5a_H1,
+    "PARCASGM_v5a_PRMC_H1": PARCASGM_v5a_PRMC_H1,
     "PARCASGM_v5a_MSPCOC":  PARCASGM_v5a_MSPCOC,
     "PARCASGM_v5a_GPRVH":   PARCASGM_v5a_GPRVH,
     "PARCASGM_v5a_GlobalRST_PosPrior_GPRVH": PARCASGM_v5a_GlobalRST_PosPrior_GPRVH,
@@ -3215,6 +3559,7 @@ MODEL_KEYWARDS_DICT = {
     "PARCASGM_v5":          model_kwargs_par_ca_sgm_v5a,
     "PARCASGM_v5a":         model_kwargs_par_ca_sgm_v5a,
     "PARCASGM_v5a_H1":      model_kwargs_par_ca_sgm_v5a,
+    "PARCASGM_v5a_PRMC_H1": model_kwargs_par_ca_sgm_v5a_prmc_h1,
     "PARCASGM_v5a_MSPCOC":  model_kwargs_par_ca_sgm_v5a_mspcoc,
     "PARCASGM_v5a_GPRVH":   model_kwargs_par_ca_sgm_v5a_gprvh,
     "PARCASGM_v5a_GlobalRST_PosPrior_GPRVH": model_kwargs_par_ca_sgm_v5a_globalrst_posprior_gprvh_s1,
