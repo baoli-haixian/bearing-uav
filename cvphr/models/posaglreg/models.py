@@ -72,6 +72,171 @@ class UnitL2Normalize(nn.Module):
         return F.normalize(vector, p=2, dim=-1, eps=self.eps)
 
 
+class SpatialGuidedCyclicDirectionCA(nn.Module):
+    """Parallel direction-aware CA over four north-aligned RST feature maps."""
+
+    def __init__(
+        self,
+        input_dim=256,
+        descriptor_dim=1024,
+        direction_dim=64,
+        num_directions=16,
+        polar_concentration=12.0,
+        attention_temperature=0.5,
+        direction_scale=1.0,
+        gate_bias=-2.0,
+    ):
+        super().__init__()
+        if direction_dim <= 0 or num_directions < 4:
+            raise ValueError("Direction dimensions and bin count must be positive")
+        if polar_concentration <= 0 or attention_temperature <= 0:
+            raise ValueError("Polar concentration and temperature must be positive")
+
+        self.num_directions = int(num_directions)
+        self.polar_concentration = float(polar_concentration)
+        self.attention_temperature = float(attention_temperature)
+
+        def projector():
+            return nn.Sequential(
+                nn.Conv2d(input_dim, direction_dim, kernel_size=1, bias=False),
+                nn.GroupNorm(8, direction_dim),
+                nn.GELU(),
+            )
+
+        # RST and UAV maps come from the official shared encoder. Keeping this
+        # projection shared preserves their initial correlation geometry.
+        self.direction_projector = projector()
+        self.direction_value = nn.Sequential(
+            nn.Linear(direction_dim, descriptor_dim),
+            nn.LayerNorm(descriptor_dim),
+        )
+        self.direction_scale_raw = nn.Parameter(
+            torch.tensor(math.log(math.expm1(float(direction_scale))))
+        )
+        self.context_gate = nn.Sequential(
+            nn.Linear(3 * descriptor_dim, 128),
+            nn.GELU(),
+            nn.Linear(128, 1),
+        )
+        nn.init.zeros_(self.context_gate[-1].weight)
+        nn.init.constant_(self.context_gate[-1].bias, gate_bias)
+
+        angles = torch.arange(num_directions, dtype=torch.float32)
+        angles = angles * (2.0 * math.pi / num_directions)
+        self.register_buffer('direction_angles', angles)
+        self.register_buffer(
+            'heading_basis', torch.stack((angles.cos(), angles.sin()), dim=-1)
+        )
+
+    def _polar_pool(self, feature):
+        _, _, height, width = feature.shape
+        y_axis = torch.linspace(
+            -1.0, 1.0, height, dtype=feature.dtype, device=feature.device
+        )
+        x_axis = torch.linspace(
+            -1.0, 1.0, width, dtype=feature.dtype, device=feature.device
+        )
+        yy, xx = torch.meshgrid(y_axis, x_axis, indexing='ij')
+        pixel_angle = torch.atan2(yy, xx)
+        radius = torch.sqrt(xx.square() + yy.square()).clamp_max(1.0)
+        angles = self.direction_angles.to(dtype=feature.dtype)
+        weights = torch.exp(
+            self.polar_concentration
+            * (torch.cos(pixel_angle.unsqueeze(0) - angles[:, None, None]) - 1.0)
+        )
+        weights = weights * radius.unsqueeze(0)
+        weights = weights / weights.sum(
+            dim=(-2, -1), keepdim=True
+        ).clamp_min(1e-8)
+        return torch.einsum('bchw,ahw->bac', feature, weights)
+
+    @staticmethod
+    def _standardize(logits, dimensions):
+        mean = logits.mean(dim=dimensions, keepdim=True)
+        variance = (logits - mean).square().mean(dim=dimensions, keepdim=True)
+        return (logits - mean) / torch.sqrt(variance + 1e-6)
+
+    def _cyclic_scores(self, rst_tokens, uav_tokens):
+        rst_tokens = F.normalize(rst_tokens, dim=-1, eps=1e-6)
+        uav_tokens = F.normalize(uav_tokens, dim=-1, eps=1e-6)
+        scores = []
+        for shift in range(self.num_directions):
+            aligned_rst = torch.roll(rst_tokens, shifts=shift, dims=2)
+            scores.append(
+                (aligned_rst * uav_tokens[:, None]).sum(dim=-1).mean(dim=-1)
+            )
+        return torch.stack(scores, dim=-1)
+
+    def forward(
+        self,
+        rst_maps,
+        uav_map,
+        semantic_tile_logits,
+        uav_descriptor,
+        official_context,
+    ):
+        if rst_maps.dim() != 5 or rst_maps.size(1) != 4:
+            raise ValueError(
+                f"Expected RST maps [B,4,C,H,W], got {tuple(rst_maps.shape)}"
+            )
+        batch_size, num_tiles, channels, height, width = rst_maps.shape
+        rst_projected = self.direction_projector(
+            rst_maps.reshape(batch_size * num_tiles, channels, height, width)
+        )
+        rst_tokens = self._polar_pool(rst_projected).reshape(
+            batch_size, num_tiles, self.num_directions, -1
+        )
+        uav_tokens = self._polar_pool(self.direction_projector(uav_map))
+        direction_logits = self._cyclic_scores(rst_tokens, uav_tokens)
+
+        semantic_normalized = self._standardize(semantic_tile_logits, (1,))
+        direction_normalized = self._standardize(direction_logits, (1, 2))
+        direction_scale = F.softplus(self.direction_scale_raw)
+        joint_logits = (
+            semantic_normalized.unsqueeze(-1)
+            + direction_scale * direction_normalized
+        )
+        joint_attention = torch.softmax(
+            joint_logits.flatten(1) / self.attention_temperature, dim=-1
+        ).reshape(batch_size, num_tiles, self.num_directions)
+
+        direction_context = torch.einsum(
+            'bja,bjad->bd', joint_attention, rst_tokens
+        )
+        direction_context = self.direction_value(direction_context)
+        gate = torch.sigmoid(
+            self.context_gate(
+                torch.cat(
+                    (uav_descriptor, official_context, direction_context), dim=-1
+                )
+            )
+        )
+        heading_context = official_context + gate * direction_context
+
+        orientation_logits = torch.logsumexp(
+            joint_logits / self.attention_temperature, dim=1
+        )
+        orientation_probability = torch.softmax(orientation_logits, dim=-1)
+        raw_heading = orientation_probability @ self.heading_basis.to(
+            dtype=orientation_probability.dtype
+        )
+        correlation_heading = F.normalize(raw_heading, dim=-1, eps=1e-6)
+        return heading_context, {
+            'direction_tokens_rst': rst_tokens,
+            'direction_tokens_uav': uav_tokens,
+            'direction_logits': direction_logits,
+            'semantic_tile_logits': semantic_tile_logits,
+            'joint_logits': joint_logits,
+            'joint_attention': joint_attention,
+            'orientation_logits': orientation_logits,
+            'orientation_probability': orientation_probability,
+            'correlation_heading': correlation_heading,
+            'direction_context': direction_context,
+            'direction_gate': gate,
+            'direction_scale': direction_scale,
+        }
+
+
 class ParallelRotationMarginalizedHeadingHead(nn.Module):
     """Estimate heading by globally matching rotated UAV feature templates."""
 
@@ -2003,6 +2168,167 @@ class PARCASGM_v5a_GlobalRST_PosPrior(PARCASGM_v5a_GlobalRST):
         return pos_pred, dir_pred
 
 
+class PARCASGM_v5a_GlobalRST_PosPrior_SGCDCA(
+    PARCASGM_v5a_GlobalRST_PosPrior
+):
+    """Experiment F + parallel spatial-guided cyclic direction CA."""
+
+    model_name = 'phr5_f_sgcdca'
+    default_loss_type = 'sgcdca'
+    uses_heading_distribution_loss = True
+
+    def __init__(
+        self,
+        *args,
+        heading_direction_dim=64,
+        heading_num_directions=16,
+        heading_polar_concentration=12.0,
+        heading_attention_temperature=0.5,
+        heading_direction_scale=1.0,
+        heading_gate_bias=-2.0,
+        heading_kappa=16.0,
+        heading_distribution_weight=0.1,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        if heading_kappa <= 0 or heading_distribution_weight < 0:
+            raise ValueError("Heading loss settings must be non-negative")
+        self.model_name = type(self).model_name
+        self.heading_kappa = float(heading_kappa)
+        self.heading_distribution_weight = float(heading_distribution_weight)
+        descriptor_dim = self.feature_dim * self.num_clusters
+        self.sgcdca_heading = SpatialGuidedCyclicDirectionCA(
+            input_dim=self.feature_dim,
+            descriptor_dim=descriptor_dim,
+            direction_dim=heading_direction_dim,
+            num_directions=heading_num_directions,
+            polar_concentration=heading_polar_concentration,
+            attention_temperature=heading_attention_temperature,
+            direction_scale=heading_direction_scale,
+            gate_bias=heading_gate_bias,
+        )
+
+    def forward(
+        self,
+        patches,
+        debug_dir='',
+        return_aux=False,
+        attention_temperature=1.0,
+    ):
+        if patches.dim() != 5 or patches.size(1) != 5:
+            raise ValueError(
+                f"Expected patches shaped [B, 5, C, H, W], got {tuple(patches.shape)}"
+            )
+
+        batch_size = patches.size(0)
+        sgm_outputs = [self.sgm(patches[:, index]) for index in range(5)]
+        original_rst_descriptors = torch.stack(
+            [output['descriptor_flatten'] for output in sgm_outputs[:4]], dim=1
+        )
+        rst_maps = torch.stack(
+            [output['nl_feat'] for output in sgm_outputs[:4]], dim=1
+        )
+        uav_descriptor = sgm_outputs[4]['descriptor_flatten']
+        uav_map = sgm_outputs[4]['nl_feat']
+
+        fusion_output = self.rst_global_fusion(
+            rst_maps, original_rst_descriptors, return_aux=return_aux
+        )
+        if return_aux:
+            global_rst_descriptors, auxiliary = fusion_output
+        else:
+            global_rst_descriptors = fusion_output
+            auxiliary = {}
+
+        known_coords = patches.new_tensor(
+            [[-1.0, -1.0], [-1.0, 1.0], [1.0, -1.0], [1.0, 1.0]]
+        )
+        coord_embs = self.coord_encoder(known_coords).unsqueeze(0).expand(
+            batch_size, -1, -1
+        )
+        prior_output = self.sim_pos_prior(
+            uav_descriptor,
+            global_rst_descriptors,
+            temperature=attention_temperature,
+            return_weights=return_aux,
+        )
+        if return_aux:
+            pos_soft_prior, prior_weights = prior_output
+            auxiliary['attention_weights'] = prior_weights
+            auxiliary['position_prior'] = pos_soft_prior
+            auxiliary['global_rst_descriptors'] = global_rst_descriptors
+        else:
+            pos_soft_prior = prior_output
+
+        official_keys = original_rst_descriptors
+        if self.add_patch_coord:
+            official_keys = official_keys + coord_embs
+        query = self.neighbors_cross_attn.q_proj(uav_descriptor).unsqueeze(1)
+        keys = self.neighbors_cross_attn.k_proj(official_keys)
+        values = self.neighbors_cross_attn.v_proj(official_keys)
+        semantic_logits = torch.bmm(query, keys.transpose(1, 2)).squeeze(1)
+        semantic_logits = semantic_logits / math.sqrt(query.size(-1))
+        official_weights = torch.softmax(semantic_logits, dim=-1)
+        official_context = torch.bmm(
+            official_weights.unsqueeze(1), values
+        ).squeeze(1)
+
+        position_combined = torch.cat((uav_descriptor, official_context), dim=1)
+        pos_pred = self.pos_regressor(
+            torch.cat((position_combined, pos_soft_prior), dim=1)
+        )
+        heading_context, heading_auxiliary = self.sgcdca_heading(
+            rst_maps,
+            uav_map,
+            semantic_logits,
+            uav_descriptor,
+            official_context,
+        )
+        heading_combined = torch.cat((uav_descriptor, heading_context), dim=1)
+        dir_pred = self.dir_regressor(heading_combined)
+
+        if return_aux:
+            auxiliary.update(heading_auxiliary)
+            auxiliary['official_ca_attention'] = official_weights
+            auxiliary['final_heading'] = dir_pred
+            return pos_pred, dir_pred, auxiliary
+        return pos_pred, dir_pred
+
+    def compute_heading_losses(
+        self, auxiliary, target_heading, target_position=None
+    ):
+        del target_position
+        target_heading = F.normalize(
+            target_heading.float(), p=2, dim=-1, eps=1e-6
+        )
+        probability = auxiliary['orientation_probability'].float()
+        target_angle = torch.atan2(target_heading[:, 1], target_heading[:, 0])
+        basis = self.sgcdca_heading.heading_basis.float()
+        bin_angles = torch.atan2(basis[:, 1], basis[:, 0])
+        circular_offset = bin_angles.unsqueeze(0) - target_angle.unsqueeze(1)
+        soft_target = torch.softmax(
+            self.heading_kappa * torch.cos(circular_offset), dim=-1
+        )
+        distribution = -(
+            soft_target * probability.clamp_min(1e-8).log()
+        ).sum(dim=-1).mean()
+        final_heading = auxiliary['final_heading'].float()
+        vector = F.smooth_l1_loss(final_heading, target_heading)
+        normalized_heading = F.normalize(
+            final_heading, p=2, dim=-1, eps=1e-6
+        )
+        correlation = (
+            1.0 - (normalized_heading * target_heading).sum(dim=-1)
+        ).mean()
+        total = vector + self.heading_distribution_weight * distribution
+        return {
+            'distribution': distribution,
+            'correlation': correlation,
+            'final': vector,
+            'total': total,
+        }
+
+
 class PARCASGM_v5a_GlobalRST_PosPrior_LCPR1(
     PARCASGM_v5a_GlobalRST_PosPrior
 ):
@@ -3412,6 +3738,18 @@ model_kwargs_par_ca_sgm_v5a_globalrst = {
     'global_dropout': 0.1,
 }
 
+model_kwargs_par_ca_sgm_v5a_f_sgcdca = {
+    **model_kwargs_par_ca_sgm_v5a_globalrst,
+    'heading_direction_dim': 64,
+    'heading_num_directions': 16,
+    'heading_polar_concentration': 12.0,
+    'heading_attention_temperature': 0.5,
+    'heading_direction_scale': 1.0,
+    'heading_gate_bias': -2.0,
+    'heading_kappa': 16.0,
+    'heading_distribution_weight': 0.1,
+}
+
 model_kwargs_par_ca_sgm_v5a_globalrst_aux = {
     **model_kwargs_par_ca_sgm_v5a_globalrst,
     'quad_loss_weight': 0.05,
@@ -3550,6 +3888,7 @@ MODEL_CLASS_DICT = {
     "PARCASGM_v5a_MSRDCP_P5": PARCASGM_v5a_MSRDCP_P5,
     "PARCASGM_v5a_GlobalRST": PARCASGM_v5a_GlobalRST,
     "PARCASGM_v5a_GlobalRST_PosPrior": PARCASGM_v5a_GlobalRST_PosPrior,
+    "PARCASGM_v5a_GlobalRST_PosPrior_SGCDCA": PARCASGM_v5a_GlobalRST_PosPrior_SGCDCA,
     "PARCASGM_v5a_GlobalRST_Quad": PARCASGM_v5a_GlobalRST_Quad,
     "PARCASGM_v5a_GlobalRST_Attn": PARCASGM_v5a_GlobalRST_Attn,
     "PARCASGM_v5a_GlobalRST_Aux": PARCASGM_v5a_GlobalRST_Aux,
@@ -3568,6 +3907,7 @@ MODEL_KEYWARDS_DICT = {
     "PARCASGM_v5a_MSRDCP_P5": model_kwargs_par_ca_sgm_v5a_msrdcp_p5,
     "PARCASGM_v5a_GlobalRST": model_kwargs_par_ca_sgm_v5a_globalrst,
     "PARCASGM_v5a_GlobalRST_PosPrior": model_kwargs_par_ca_sgm_v5a_globalrst,
+    "PARCASGM_v5a_GlobalRST_PosPrior_SGCDCA": model_kwargs_par_ca_sgm_v5a_f_sgcdca,
     "PARCASGM_v5a_GlobalRST_Quad": model_kwargs_par_ca_sgm_v5a_globalrst_quad,
     "PARCASGM_v5a_GlobalRST_Attn": model_kwargs_par_ca_sgm_v5a_globalrst_attn,
     "PARCASGM_v5a_GlobalRST_Aux": model_kwargs_par_ca_sgm_v5a_globalrst_aux,

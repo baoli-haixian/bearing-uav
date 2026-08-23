@@ -233,6 +233,12 @@ def train_par(
             'Using P-RMC heading objective: SmoothL1 heading vector + '
             'von Mises rotation-distribution loss'
         )
+    elif loss_type == 'sgcdca':
+        criterion = nn.SmoothL1Loss()
+        print(
+            'Using SG-CDCA heading objective: SmoothL1 heading vector + '
+            'circular soft-label distribution loss'
+        )
     elif loss_type == 'smoothl1' or loss_type == 'pos_smoothl1' or loss_type == 'dir_smoothl1':
         criterion = nn.SmoothL1Loss()
         print(f'Using loss function: SmoothL1Loss(pos_weight={pos_weight}, dir_weight={dir_weight})')
