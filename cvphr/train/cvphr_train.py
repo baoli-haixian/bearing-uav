@@ -357,6 +357,16 @@ def train_par(
         'nan_loss_count': 0,   # Record NaN loss count
         'log_no_val_pred': []  # Log error: len(all_val_pos_pred) == 0
     }
+    adapter_metric_names = (
+        'adapter_alpha_position',
+        'adapter_alpha_heading_rst',
+        'adapter_alpha_heading_uav',
+        'adapter_ratio_position',
+        'adapter_ratio_heading_rst',
+        'adapter_ratio_heading_uav',
+    )
+    for metric_name in adapter_metric_names:
+        history.setdefault(metric_name, [])
 
     # Mixed precision gradient scaler (only enable on CUDA)
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
@@ -803,6 +813,15 @@ def train_par(
         history['train_loss_sum_pos_dir'].append([train_loss, train_loss_pos, train_loss_dir])
         history['val_loss_sum_pos_dir'].append([val_loss, val_loss_pos, val_loss_dir])
 
+        adapter_stats = {}
+        if hasattr(raw_model, 'adapter_statistics'):
+            adapter_stats = raw_model.adapter_statistics()
+            for metric_name in adapter_metric_names:
+                if metric_name in adapter_stats:
+                    history.setdefault(metric_name, []).append(
+                        adapter_stats[metric_name]
+                    )
+
         # Record to tensorboard
         writer.add_scalar('Loss/train', train_loss, epoch)
         writer.add_scalar('Loss/train_pose', train_pose_loss, epoch)
@@ -846,6 +865,8 @@ def train_par(
             writer.add_scalar('H2/val_final', val_heading_final, epoch)
             writer.add_scalar('H2/val_gate_mean', val_heading_gate, epoch)
         writer.add_scalar('Learning Rate', optimizer.param_groups[0]['lr'], epoch)
+        for metric_name, metric_value in adapter_stats.items():
+            writer.add_scalar(f'Adapter/{metric_name}', metric_value, epoch)
 
         if scheduler_class == "ReduceLROnPlateau":
             # Adjust learning rate
@@ -925,7 +946,12 @@ def train_par(
                 f"weighted_attn={train_loss_attention_weighted:.6f}, "
                 f"aux_scale={auxiliary_warmup_scale:.3f}, "
                 f"val_pos={val_loss_pos:.6f}, val_dir={val_loss_dir:.6f}, "
-                f"lr={optimizer.param_groups[0]['lr']:.6e}\n"
+                f"lr={optimizer.param_groups[0]['lr']:.6e}"
+                + ''.join(
+                    f", {name}={value:.6f}"
+                    for name, value in adapter_stats.items()
+                )
+                + "\n"
             )
 
         # End of current epoch

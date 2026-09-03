@@ -2974,6 +2974,160 @@ class PARCASGM_v5a_GlobalRST_PosPrior_PRMC_H1(PARCASGM_v5a_PRMC_H1):
         return position, rst_maps, uav_map
 
 
+class SpatialTaskAdapter(nn.Module):
+    """Lightweight residual adapter for task-specific spatial refinement."""
+
+    def __init__(self, dim=256, bottleneck=64, groups=8):
+        super().__init__()
+        if dim <= 0 or bottleneck <= 0:
+            raise ValueError("Adapter dimensions must be positive")
+        if bottleneck % groups != 0:
+            raise ValueError("Adapter bottleneck must be divisible by GN groups")
+        self.adapter = nn.Sequential(
+            nn.Conv2d(dim, bottleneck, kernel_size=1, bias=False),
+            nn.GroupNorm(groups, bottleneck),
+            nn.GELU(),
+            nn.Conv2d(
+                bottleneck,
+                bottleneck,
+                kernel_size=3,
+                padding=1,
+                groups=bottleneck,
+                bias=False,
+            ),
+            nn.GroupNorm(groups, bottleneck),
+            nn.GELU(),
+            nn.Conv2d(bottleneck, dim, kernel_size=1, bias=False),
+        )
+        # Exact identity at initialization while retaining a learnable residual.
+        self.alpha = nn.Parameter(torch.zeros(1))
+        self.last_residual_ratio = None
+
+    def forward(self, feature):
+        residual = self.adapter(feature)
+        with torch.no_grad():
+            feature_norm = feature.detach().float().norm().clamp_min(1e-8)
+            residual_norm = (self.alpha * residual).detach().float().norm()
+            self.last_residual_ratio = residual_norm / feature_norm
+        return feature + self.alpha * residual
+
+
+class PARCASGM_v5a_GlobalRST_PosPrior_PRMC_TaskAdapters(
+    PARCASGM_v5a_GlobalRST_PosPrior_PRMC_H1
+):
+    """F+P-RMC with lightweight position and cross-view heading adapters."""
+
+    model_name = 'phr5_f_h1_prmc_taskadapters'
+    requires_init_checkpoint = True
+    initialization_missing_prefixes = (
+        'position_adapter.',
+        'heading_rst_adapter.',
+        'heading_uav_adapter.',
+    )
+
+    def __init__(self, *args, adapter_bottleneck=64, adapter_groups=8, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.model_name = type(self).model_name
+        adapter_kwargs = {
+            'dim': self.feature_dim,
+            'bottleneck': adapter_bottleneck,
+            'groups': adapter_groups,
+        }
+        # Four RSTs share each task adapter. The UAV heading adapter is separate
+        # because its feature statistics differ from the satellite view.
+        self.position_adapter = SpatialTaskAdapter(**adapter_kwargs)
+        self.heading_rst_adapter = SpatialTaskAdapter(**adapter_kwargs)
+        self.heading_uav_adapter = SpatialTaskAdapter(**adapter_kwargs)
+
+    @staticmethod
+    def _adapt_rst_maps(adapter, rst_maps):
+        batch_size, num_rst, channels, height, width = rst_maps.shape
+        adapted = adapter(
+            rst_maps.reshape(batch_size * num_rst, channels, height, width)
+        )
+        return adapted.reshape(
+            batch_size, num_rst, channels, height, width
+        )
+
+    def _position_forward_with_maps(self, patches):
+        batch_size = patches.size(0)
+        sgm_outputs = [self.sgm(patches[:, index]) for index in range(5)]
+        original_rst_descriptors = torch.stack(
+            [output['descriptor_flatten'] for output in sgm_outputs[:4]], dim=1
+        )
+        rst_maps_shared = torch.stack(
+            [output['nl_feat'] for output in sgm_outputs[:4]], dim=1
+        )
+        uav_descriptor = sgm_outputs[4]['descriptor_flatten']
+        uav_map_shared = sgm_outputs[4]['nl_feat']
+
+        rst_maps_position = self._adapt_rst_maps(
+            self.position_adapter, rst_maps_shared
+        )
+        global_rst_descriptors = self.rst_global_fusion(
+            rst_maps_position, original_rst_descriptors
+        )
+        pos_soft_prior = self.sim_pos_prior(
+            uav_descriptor, global_rst_descriptors
+        )
+
+        known_coords = uav_descriptor.new_tensor(
+            [[-1.0, -1.0], [-1.0, 1.0], [1.0, -1.0], [1.0, 1.0]]
+        )
+        coord_embs = self.coord_encoder(known_coords).unsqueeze(0).expand(
+            batch_size, -1, -1
+        )
+        official_ca_features = original_rst_descriptors
+        if self.add_patch_coord:
+            official_ca_features = official_ca_features + coord_embs
+        official_context = self.neighbors_cross_attn(
+            uav_descriptor, official_ca_features
+        )
+        combined = torch.cat((uav_descriptor, official_context), dim=1)
+        position = self.pos_regressor(
+            torch.cat((combined, pos_soft_prior), dim=1)
+        )
+
+        rst_maps_heading = self._adapt_rst_maps(
+            self.heading_rst_adapter, rst_maps_shared
+        )
+        uav_map_heading = self.heading_uav_adapter(uav_map_shared)
+        return position, rst_maps_heading, uav_map_heading
+
+    def forward(self, patches, debug_dir='', return_aux=False):
+        if patches.dim() != 5 or patches.size(1) != 5:
+            raise ValueError(
+                f"Expected patches shaped [B, 5, C, H, W], got {tuple(patches.shape)}"
+            )
+        position, rst_maps, uav_map = self._position_forward_with_maps(patches)
+        heading, auxiliary = self.prmc_head(rst_maps, uav_map)
+        auxiliary.update(self.adapter_statistics(as_tensors=True))
+        if return_aux:
+            return position, heading, auxiliary
+        return position, heading
+
+    def adapter_statistics(self, as_tensors=False):
+        stats = {
+            'adapter_alpha_position': self.position_adapter.alpha,
+            'adapter_alpha_heading_rst': self.heading_rst_adapter.alpha,
+            'adapter_alpha_heading_uav': self.heading_uav_adapter.alpha,
+        }
+        for name, adapter in (
+            ('adapter_ratio_position', self.position_adapter),
+            ('adapter_ratio_heading_rst', self.heading_rst_adapter),
+            ('adapter_ratio_heading_uav', self.heading_uav_adapter),
+        ):
+            ratio = adapter.last_residual_ratio
+            if ratio is not None:
+                stats[name] = ratio
+        if as_tensors:
+            return stats
+        return {
+            key: float(value.detach().cpu())
+            for key, value in stats.items()
+        }
+
+
 class PARCASGM_v5a_MSPCOC(PARCASGM_v5a):
     """Experiment H2: learned cross-view orientation correlation."""
 
@@ -3880,6 +4034,12 @@ model_kwargs_par_ca_sgm_v5a_f_prmc_h1 = {
     },
 }
 
+model_kwargs_par_ca_sgm_v5a_f_prmc_taskadapters = {
+    **model_kwargs_par_ca_sgm_v5a_f_prmc_h1,
+    'adapter_bottleneck': 64,
+    'adapter_groups': 8,
+}
+
 model_kwargs_par_ca_sgm_v5a_gprvh = {
     **model_kwargs_par_ca_sgm_v5a,
     'heading_feature_dim': 64,
@@ -3955,6 +4115,7 @@ MODEL_CLASS_DICT = {
     "PARCASGM_v5a_H1":      PARCASGM_v5a_H1,
     "PARCASGM_v5a_PRMC_H1": PARCASGM_v5a_PRMC_H1,
     "PARCASGM_v5a_GlobalRST_PosPrior_PRMC_H1": PARCASGM_v5a_GlobalRST_PosPrior_PRMC_H1,
+    "PARCASGM_v5a_GlobalRST_PosPrior_PRMC_TaskAdapters": PARCASGM_v5a_GlobalRST_PosPrior_PRMC_TaskAdapters,
     "PARCASGM_v5a_MSPCOC":  PARCASGM_v5a_MSPCOC,
     "PARCASGM_v5a_GPRVH":   PARCASGM_v5a_GPRVH,
     "PARCASGM_v5a_GlobalRST_PosPrior_GPRVH": PARCASGM_v5a_GlobalRST_PosPrior_GPRVH,
@@ -3975,6 +4136,7 @@ MODEL_KEYWARDS_DICT = {
     "PARCASGM_v5a_H1":      model_kwargs_par_ca_sgm_v5a,
     "PARCASGM_v5a_PRMC_H1": model_kwargs_par_ca_sgm_v5a_prmc_h1,
     "PARCASGM_v5a_GlobalRST_PosPrior_PRMC_H1": model_kwargs_par_ca_sgm_v5a_f_prmc_h1,
+    "PARCASGM_v5a_GlobalRST_PosPrior_PRMC_TaskAdapters": model_kwargs_par_ca_sgm_v5a_f_prmc_taskadapters,
     "PARCASGM_v5a_MSPCOC":  model_kwargs_par_ca_sgm_v5a_mspcoc,
     "PARCASGM_v5a_GPRVH":   model_kwargs_par_ca_sgm_v5a_gprvh,
     "PARCASGM_v5a_GlobalRST_PosPrior_GPRVH": model_kwargs_par_ca_sgm_v5a_globalrst_posprior_gprvh_s1,
