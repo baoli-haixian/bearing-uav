@@ -420,6 +420,175 @@ class ParallelRotationMarginalizedHeadingHead(nn.Module):
             'resultant': raw_heading.norm(dim=-1),
         }
 
+
+class GeometryAdaptiveRotationMarginalizedHeadingHead(
+    ParallelRotationMarginalizedHeadingHead
+):
+    """P-RMC with a constrained per-sample stretch before rotation matching."""
+
+    def __init__(
+        self,
+        *args,
+        deformation_hidden_dim=32,
+        max_log_scale=0.18,
+        max_anisotropy=0.15,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        if deformation_hidden_dim <= 0:
+            raise ValueError("Deformation hidden dimension must be positive")
+        if max_log_scale <= 0 or max_anisotropy <= 0:
+            raise ValueError("Deformation limits must be positive")
+        self.max_log_scale = float(max_log_scale)
+        self.max_anisotropy = float(max_anisotropy)
+        self.deformation_predictor = nn.Sequential(
+            nn.Linear(2 * self.feature_dim, deformation_hidden_dim),
+            nn.GELU(),
+            nn.Linear(deformation_hidden_dim, 3),
+        )
+        nn.init.zeros_(self.deformation_predictor[-1].weight)
+        nn.init.zeros_(self.deformation_predictor[-1].bias)
+
+    def _predict_stretch(self, projected_rst, projected_uav):
+        batch_size = projected_rst.size(0)
+        rst_summary = projected_rst.mean(dim=(1, 3, 4))
+        uav_summary = projected_uav.mean(dim=(2, 3))
+        raw = self.deformation_predictor(
+            torch.cat((rst_summary, uav_summary), dim=-1)
+        )
+
+        log_scale = self.max_log_scale * torch.tanh(raw[:, 0])
+        anisotropy = self.max_anisotropy * torch.tanh(raw[:, 1])
+        shear = self.max_anisotropy * torch.tanh(raw[:, 2])
+        log_stretch = raw.new_zeros(batch_size, 2, 2)
+        log_stretch[:, 0, 0] = log_scale + anisotropy
+        log_stretch[:, 1, 1] = log_scale - anisotropy
+        log_stretch[:, 0, 1] = shear
+        log_stretch[:, 1, 0] = shear
+        # Keep the tiny matrix exponential in fp32 under CUDA autocast; V100
+        # half-precision matrix_exp is not a reliable execution path.
+        stretch = torch.matrix_exp(log_stretch.float()).to(log_stretch.dtype)
+        parameters = torch.stack((log_scale, anisotropy, shear), dim=-1)
+        return stretch, log_stretch, parameters
+
+    def _deformed_rotation_bank(self, feature, stretch):
+        batch_size = feature.size(0)
+        angles = self.rotation_angles.to(device=feature.device, dtype=feature.dtype)
+        cosine, sine = angles.cos(), angles.sin()
+        rotations = torch.zeros(
+            self.num_rotations, 2, 2, device=feature.device, dtype=feature.dtype
+        )
+        rotations[:, 0, 0] = cosine
+        rotations[:, 0, 1] = -sine
+        rotations[:, 1, 0] = sine
+        rotations[:, 1, 1] = cosine
+
+        # affine_grid uses backward sampling. S @ R preserves R as the polar
+        # rotation while S models source-aligned scale and anisotropic stretch.
+        linear = torch.matmul(stretch[:, None], rotations[None])
+        matrices = feature.new_zeros(batch_size, self.num_rotations, 2, 3)
+        matrices[..., :2] = linear
+        matrices = matrices.reshape(batch_size * self.num_rotations, 2, 3)
+
+        expanded = feature[:, None].expand(
+            -1, self.num_rotations, -1, -1, -1
+        ).reshape(
+            batch_size * self.num_rotations,
+            feature.size(1),
+            feature.size(2),
+            feature.size(3),
+        )
+        grid = F.affine_grid(matrices, expanded.shape, align_corners=False)
+        rotated = F.grid_sample(
+            expanded,
+            grid,
+            mode='bilinear',
+            padding_mode='zeros',
+            align_corners=False,
+        ).reshape(
+            batch_size,
+            self.num_rotations,
+            feature.size(1),
+            feature.size(2),
+            feature.size(3),
+        )
+        validity = feature.new_ones(
+            batch_size * self.num_rotations,
+            1,
+            feature.size(2),
+            feature.size(3),
+        )
+        validity = F.grid_sample(
+            validity,
+            grid,
+            mode='bilinear',
+            padding_mode='zeros',
+            align_corners=False,
+        ).reshape(
+            batch_size,
+            self.num_rotations,
+            1,
+            feature.size(2),
+            feature.size(3),
+        )
+        return rotated, validity
+
+    def forward(self, rst_maps, uav_map):
+        if rst_maps.dim() != 5 or rst_maps.size(1) != 4:
+            raise ValueError("GA-P-RMC requires four RST feature maps")
+        if uav_map.dim() != 4 or rst_maps.size(0) != uav_map.size(0):
+            raise ValueError("GA-P-RMC UAV and RST feature batches must match")
+
+        batch_size, num_rst, channels, height, width = rst_maps.shape
+        projected_rst = self.rst_projector(
+            rst_maps.reshape(batch_size * num_rst, channels, height, width)
+        )
+        projected_rst = F.adaptive_avg_pool2d(
+            projected_rst, (self.spatial_size, self.spatial_size)
+        ).reshape(
+            batch_size,
+            num_rst,
+            self.feature_dim,
+            self.spatial_size,
+            self.spatial_size,
+        )
+        projected_uav = F.adaptive_avg_pool2d(
+            self.uav_projector(uav_map),
+            (self.spatial_size, self.spatial_size),
+        )
+        stretch, log_stretch, deformation_parameters = self._predict_stretch(
+            projected_rst, projected_uav
+        )
+        templates, validity = self._deformed_rotation_bank(projected_uav, stretch)
+        response = self._normalized_correlation(
+            self.build_mosaic(projected_rst), templates, validity
+        )
+
+        spatial_logits = response.flatten(2)
+        orientation_logits = self.translation_temperature * torch.logsumexp(
+            spatial_logits / self.translation_temperature, dim=-1
+        )
+        orientation_probability = torch.softmax(
+            orientation_logits / self.orientation_temperature, dim=-1
+        )
+        basis = self.heading_basis.to(
+            device=orientation_probability.device,
+            dtype=orientation_probability.dtype,
+        )
+        raw_heading = orientation_probability @ basis
+        heading = F.normalize(raw_heading, p=2, dim=-1, eps=1e-6)
+        return heading, {
+            'response': response,
+            'orientation_logits': orientation_logits,
+            'orientation_probability': orientation_probability,
+            'final_heading': heading,
+            'resultant': raw_heading.norm(dim=-1),
+            'deformation_matrix': stretch,
+            'deformation_log_matrix': log_stretch,
+            'deformation_parameters': deformation_parameters,
+        }
+
+
 class SimilarityPositionPrior(nn.Module):
     def __init__(self, feat_dim):
         super().__init__()
@@ -2974,6 +3143,61 @@ class PARCASGM_v5a_GlobalRST_PosPrior_PRMC_H1(PARCASGM_v5a_PRMC_H1):
         return position, rst_maps, uav_map
 
 
+class PARCASGM_v5a_GlobalRST_PosPrior_PRMC_GeometryAdaptive(
+    PARCASGM_v5a_GlobalRST_PosPrior_PRMC_H1
+):
+    """Experiment F plus geometry-adaptive P-RMC heading matching."""
+
+    model_name = 'phr5_f_prmc_ga'
+
+    def __init__(
+        self,
+        *args,
+        deformation_hidden_dim=32,
+        deformation_max_log_scale=0.18,
+        deformation_max_anisotropy=0.15,
+        deformation_regularization_weight=0.01,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        if deformation_regularization_weight < 0:
+            raise ValueError("Deformation regularization weight must be non-negative")
+        self.model_name = type(self).model_name
+        self.deformation_regularization_weight = float(
+            deformation_regularization_weight
+        )
+        self.prmc_head = GeometryAdaptiveRotationMarginalizedHeadingHead(
+            input_dim=self.feature_dim,
+            feature_dim=kwargs.get('heading_feature_dim', 64),
+            spatial_size=kwargs.get('heading_spatial_size', 8),
+            num_rotations=kwargs.get('heading_num_rotations', 36),
+            translation_temperature=kwargs.get(
+                'heading_translation_temperature', 0.2
+            ),
+            orientation_temperature=kwargs.get(
+                'heading_orientation_temperature', 0.1
+            ),
+            deformation_hidden_dim=deformation_hidden_dim,
+            max_log_scale=deformation_max_log_scale,
+            max_anisotropy=deformation_max_anisotropy,
+        )
+
+    def compute_heading_losses(
+        self, auxiliary, target_heading, target_position=None
+    ):
+        losses = super().compute_heading_losses(
+            auxiliary, target_heading, target_position=target_position
+        )
+        deformation = auxiliary['deformation_log_matrix'].float()
+        regularization = deformation.square().sum(dim=(-2, -1)).mean()
+        losses['deformation'] = regularization
+        losses['total'] = (
+            losses['total']
+            + self.deformation_regularization_weight * regularization
+        )
+        return losses
+
+
 class SpatialTaskAdapter(nn.Module):
     """Lightweight residual adapter for task-specific spatial refinement."""
 
@@ -4034,6 +4258,14 @@ model_kwargs_par_ca_sgm_v5a_f_prmc_h1 = {
     },
 }
 
+model_kwargs_par_ca_sgm_v5a_f_prmc_geometry_adaptive = {
+    **model_kwargs_par_ca_sgm_v5a_f_prmc_h1,
+    'deformation_hidden_dim': 32,
+    'deformation_max_log_scale': 0.18,
+    'deformation_max_anisotropy': 0.15,
+    'deformation_regularization_weight': 0.01,
+}
+
 model_kwargs_par_ca_sgm_v5a_f_prmc_taskadapters = {
     **model_kwargs_par_ca_sgm_v5a_f_prmc_h1,
     'adapter_bottleneck': 64,
@@ -4115,6 +4347,7 @@ MODEL_CLASS_DICT = {
     "PARCASGM_v5a_H1":      PARCASGM_v5a_H1,
     "PARCASGM_v5a_PRMC_H1": PARCASGM_v5a_PRMC_H1,
     "PARCASGM_v5a_GlobalRST_PosPrior_PRMC_H1": PARCASGM_v5a_GlobalRST_PosPrior_PRMC_H1,
+    "PARCASGM_v5a_GlobalRST_PosPrior_PRMC_GeometryAdaptive": PARCASGM_v5a_GlobalRST_PosPrior_PRMC_GeometryAdaptive,
     "PARCASGM_v5a_GlobalRST_PosPrior_PRMC_TaskAdapters": PARCASGM_v5a_GlobalRST_PosPrior_PRMC_TaskAdapters,
     "PARCASGM_v5a_MSPCOC":  PARCASGM_v5a_MSPCOC,
     "PARCASGM_v5a_GPRVH":   PARCASGM_v5a_GPRVH,
@@ -4136,6 +4369,7 @@ MODEL_KEYWARDS_DICT = {
     "PARCASGM_v5a_H1":      model_kwargs_par_ca_sgm_v5a,
     "PARCASGM_v5a_PRMC_H1": model_kwargs_par_ca_sgm_v5a_prmc_h1,
     "PARCASGM_v5a_GlobalRST_PosPrior_PRMC_H1": model_kwargs_par_ca_sgm_v5a_f_prmc_h1,
+    "PARCASGM_v5a_GlobalRST_PosPrior_PRMC_GeometryAdaptive": model_kwargs_par_ca_sgm_v5a_f_prmc_geometry_adaptive,
     "PARCASGM_v5a_GlobalRST_PosPrior_PRMC_TaskAdapters": model_kwargs_par_ca_sgm_v5a_f_prmc_taskadapters,
     "PARCASGM_v5a_MSPCOC":  model_kwargs_par_ca_sgm_v5a_mspcoc,
     "PARCASGM_v5a_GPRVH":   model_kwargs_par_ca_sgm_v5a_gprvh,
