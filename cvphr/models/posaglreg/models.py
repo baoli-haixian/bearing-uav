@@ -3143,6 +3143,230 @@ class PARCASGM_v5a_GlobalRST_PosPrior_PRMC_H1(PARCASGM_v5a_PRMC_H1):
         return position, rst_maps, uav_map
 
 
+class MatchingEvidenceCalibration(nn.Module):
+    """Calibrate four-RST CA logits with P-RMC spatial matching evidence."""
+
+    def __init__(self, spatial_temperature=0.05, eps=1e-8):
+        super().__init__()
+        if spatial_temperature <= 0:
+            raise ValueError("MEC spatial temperature must be positive")
+        self.spatial_temperature = float(spatial_temperature)
+        self.eps = float(eps)
+        # An exact zero makes a baseline checkpoint behavior-preserving at load time.
+        self.alpha = nn.Parameter(torch.zeros(1))
+
+    @staticmethod
+    def _corner_membership(size, device, dtype):
+        axis = torch.linspace(-1.0, 1.0, size, device=device, dtype=dtype)
+        row, column = torch.meshgrid(axis, axis, indexing='ij')
+        # RCE uses (row, column), matching mosaic order p1,p2 / p3,p4.
+        candidates = torch.stack((row, column), dim=-1).reshape(-1, 2)
+        corners = candidates.new_tensor(
+            [[-1.0, -1.0], [-1.0, 1.0], [1.0, -1.0], [1.0, 1.0]]
+        )
+        membership = 0.25 * (
+            1.0 + candidates[:, None, 0] * corners[None, :, 0]
+        ) * (
+            1.0 + candidates[:, None, 1] * corners[None, :, 1]
+        )
+        return membership
+
+    def forward(
+        self,
+        semantic_logits,
+        response,
+        orientation_probability,
+        heading_resultant,
+        shuffle_evidence=False,
+    ):
+        if semantic_logits.dim() != 2 or semantic_logits.size(-1) != 4:
+            raise ValueError("MEC expects four official CA logits")
+        if response.dim() != 4 or response.size(0) != semantic_logits.size(0):
+            raise ValueError("MEC response must be [B, K, H, W]")
+        if response.size(-2) != response.size(-1):
+            raise ValueError("MEC requires a square P-RMC response grid")
+        if orientation_probability.shape != response.shape[:2]:
+            raise ValueError("MEC orientation probabilities must match response bins")
+
+        response = response.float()
+        probability = orientation_probability.float().clamp_min(self.eps)
+        joint_logits = (
+            response.flatten(2) / self.spatial_temperature
+            + probability.log().unsqueeze(-1)
+        )
+        spatial_logits = torch.logsumexp(joint_logits, dim=1)
+        spatial_probability = torch.softmax(spatial_logits, dim=-1)
+
+        if shuffle_evidence:
+            if spatial_probability.size(0) > 1:
+                spatial_probability = torch.roll(
+                    spatial_probability, shifts=1, dims=0
+                )
+            else:
+                spatial_probability = spatial_probability.flip(-1)
+
+        membership = self._corner_membership(
+            response.size(-1), response.device, response.dtype
+        )
+        rst_probability = spatial_probability @ membership
+        rst_probability = rst_probability.clamp_min(self.eps)
+        rst_probability = rst_probability / rst_probability.sum(
+            dim=-1, keepdim=True
+        )
+
+        spatial_entropy = -(
+            spatial_probability
+            * spatial_probability.clamp_min(self.eps).log()
+        ).sum(dim=-1)
+        max_entropy = math.log(spatial_probability.size(-1))
+        spatial_confidence = (1.0 - spatial_entropy / max_entropy).clamp(0.0, 1.0)
+        heading_confidence = heading_resultant.float().clamp(0.0, 1.0)
+        confidence = spatial_confidence * heading_confidence
+
+        evidence_bias = rst_probability.log()
+        evidence_bias = evidence_bias - evidence_bias.mean(dim=-1, keepdim=True)
+        gate = torch.tanh(self.alpha).to(semantic_logits.dtype)
+        calibrated_logits = semantic_logits + gate * (
+            confidence[:, None] * evidence_bias
+        ).to(semantic_logits.dtype)
+        return calibrated_logits, {
+            'mec_spatial_probability': spatial_probability,
+            'mec_rst_probability': rst_probability,
+            'mec_spatial_confidence': spatial_confidence,
+            'mec_confidence': confidence,
+            'mec_gate': gate,
+            'mec_evidence_bias': evidence_bias,
+        }
+
+
+class PARCASGM_v5a_GlobalRST_PosPrior_PRMC_MEC(
+    PARCASGM_v5a_GlobalRST_PosPrior_PRMC_H1
+):
+    """F+P-RMC with P-RMC matching evidence calibrating official CA."""
+
+    model_name = 'phr5_f_prmc_mec'
+    initialization_missing_prefixes = ('matching_evidence_calibration.',)
+
+    def __init__(
+        self,
+        *args,
+        mec_spatial_temperature=0.05,
+        mec_detach_evidence=False,
+        mec_shuffle_evidence=False,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.model_name = type(self).model_name
+        self.mec_detach_evidence = bool(mec_detach_evidence)
+        self.mec_shuffle_evidence = bool(mec_shuffle_evidence)
+        self.matching_evidence_calibration = MatchingEvidenceCalibration(
+            spatial_temperature=mec_spatial_temperature
+        )
+
+    def forward(self, patches, debug_dir='', return_aux=False):
+        if patches.dim() != 5 or patches.size(1) != 5:
+            raise ValueError(
+                f"Expected patches shaped [B, 5, C, H, W], got {tuple(patches.shape)}"
+            )
+        batch_size = patches.size(0)
+        sgm_outputs = [self.sgm(patches[:, index]) for index in range(5)]
+        original_rst_descriptors = torch.stack(
+            [output['descriptor_flatten'] for output in sgm_outputs[:4]], dim=1
+        )
+        rst_maps = torch.stack(
+            [output['nl_feat'] for output in sgm_outputs[:4]], dim=1
+        )
+        uav_descriptor = sgm_outputs[4]['descriptor_flatten']
+        uav_map = sgm_outputs[4]['nl_feat']
+
+        heading, heading_auxiliary = self.prmc_head(rst_maps, uav_map)
+        global_rst_descriptors = self.rst_global_fusion(
+            rst_maps, original_rst_descriptors
+        )
+        pos_soft_prior = self.sim_pos_prior(
+            uav_descriptor, global_rst_descriptors
+        )
+
+        known_coords = uav_descriptor.new_tensor(
+            [[-1.0, -1.0], [-1.0, 1.0], [1.0, -1.0], [1.0, 1.0]]
+        )
+        coord_embs = self.coord_encoder(known_coords).unsqueeze(0).expand(
+            batch_size, -1, -1
+        )
+        official_keys = original_rst_descriptors
+        if self.add_patch_coord:
+            official_keys = official_keys + coord_embs
+        query = self.neighbors_cross_attn.q_proj(uav_descriptor).unsqueeze(1)
+        keys = self.neighbors_cross_attn.k_proj(official_keys)
+        values = self.neighbors_cross_attn.v_proj(official_keys)
+        semantic_logits = torch.bmm(query, keys.transpose(1, 2)).squeeze(1)
+        semantic_logits = semantic_logits / math.sqrt(query.size(-1))
+
+        response = heading_auxiliary['response']
+        orientation_probability = heading_auxiliary['orientation_probability']
+        heading_resultant = heading_auxiliary['resultant']
+        if self.mec_detach_evidence:
+            response = response.detach()
+            orientation_probability = orientation_probability.detach()
+            heading_resultant = heading_resultant.detach()
+        calibrated_logits, mec_auxiliary = self.matching_evidence_calibration(
+            semantic_logits,
+            response,
+            orientation_probability,
+            heading_resultant,
+            shuffle_evidence=self.mec_shuffle_evidence,
+        )
+        calibrated_weights = torch.softmax(calibrated_logits, dim=-1)
+        official_context = torch.bmm(
+            calibrated_weights.unsqueeze(1), values
+        ).squeeze(1)
+        combined = torch.cat((uav_descriptor, official_context), dim=1)
+        position = self.pos_regressor(
+            torch.cat((combined, pos_soft_prior), dim=1)
+        )
+
+        if return_aux:
+            heading_auxiliary.update(mec_auxiliary)
+            heading_auxiliary['official_ca_logits'] = semantic_logits
+            heading_auxiliary['calibrated_ca_logits'] = calibrated_logits
+            heading_auxiliary['calibrated_ca_attention'] = calibrated_weights
+            return position, heading, heading_auxiliary
+        return position, heading
+
+
+class PARCASGM_v5a_GlobalRST_PosPrior_PRMC_MECDetach(
+    PARCASGM_v5a_GlobalRST_PosPrior_PRMC_MEC
+):
+    model_name = 'phr5_f_prmc_mec_detach'
+
+    def __init__(self, *args, **kwargs):
+        kwargs['mec_detach_evidence'] = True
+        kwargs['mec_shuffle_evidence'] = False
+        super().__init__(*args, **kwargs)
+
+
+class PARCASGM_v5a_GlobalRST_PosPrior_PRMC_MECJoint(
+    PARCASGM_v5a_GlobalRST_PosPrior_PRMC_MEC
+):
+    model_name = 'phr5_f_prmc_mec_joint'
+
+    def __init__(self, *args, **kwargs):
+        kwargs['mec_detach_evidence'] = False
+        kwargs['mec_shuffle_evidence'] = False
+        super().__init__(*args, **kwargs)
+
+
+class PARCASGM_v5a_GlobalRST_PosPrior_PRMC_MECShuffle(
+    PARCASGM_v5a_GlobalRST_PosPrior_PRMC_MEC
+):
+    model_name = 'phr5_f_prmc_mec_shuffle'
+
+    def __init__(self, *args, **kwargs):
+        kwargs['mec_detach_evidence'] = True
+        kwargs['mec_shuffle_evidence'] = True
+        super().__init__(*args, **kwargs)
+
+
 class PARCASGM_v5a_GlobalRST_PosPrior_PRMC_GeometryAdaptive(
     PARCASGM_v5a_GlobalRST_PosPrior_PRMC_H1
 ):
@@ -4258,6 +4482,11 @@ model_kwargs_par_ca_sgm_v5a_f_prmc_h1 = {
     },
 }
 
+model_kwargs_par_ca_sgm_v5a_f_prmc_mec = {
+    **model_kwargs_par_ca_sgm_v5a_f_prmc_h1,
+    'mec_spatial_temperature': 0.05,
+}
+
 model_kwargs_par_ca_sgm_v5a_f_prmc_geometry_adaptive = {
     **model_kwargs_par_ca_sgm_v5a_f_prmc_h1,
     'deformation_hidden_dim': 32,
@@ -4347,6 +4576,9 @@ MODEL_CLASS_DICT = {
     "PARCASGM_v5a_H1":      PARCASGM_v5a_H1,
     "PARCASGM_v5a_PRMC_H1": PARCASGM_v5a_PRMC_H1,
     "PARCASGM_v5a_GlobalRST_PosPrior_PRMC_H1": PARCASGM_v5a_GlobalRST_PosPrior_PRMC_H1,
+    "PARCASGM_v5a_GlobalRST_PosPrior_PRMC_MECDetach": PARCASGM_v5a_GlobalRST_PosPrior_PRMC_MECDetach,
+    "PARCASGM_v5a_GlobalRST_PosPrior_PRMC_MECJoint": PARCASGM_v5a_GlobalRST_PosPrior_PRMC_MECJoint,
+    "PARCASGM_v5a_GlobalRST_PosPrior_PRMC_MECShuffle": PARCASGM_v5a_GlobalRST_PosPrior_PRMC_MECShuffle,
     "PARCASGM_v5a_GlobalRST_PosPrior_PRMC_GeometryAdaptive": PARCASGM_v5a_GlobalRST_PosPrior_PRMC_GeometryAdaptive,
     "PARCASGM_v5a_GlobalRST_PosPrior_PRMC_TaskAdapters": PARCASGM_v5a_GlobalRST_PosPrior_PRMC_TaskAdapters,
     "PARCASGM_v5a_MSPCOC":  PARCASGM_v5a_MSPCOC,
@@ -4369,6 +4601,9 @@ MODEL_KEYWARDS_DICT = {
     "PARCASGM_v5a_H1":      model_kwargs_par_ca_sgm_v5a,
     "PARCASGM_v5a_PRMC_H1": model_kwargs_par_ca_sgm_v5a_prmc_h1,
     "PARCASGM_v5a_GlobalRST_PosPrior_PRMC_H1": model_kwargs_par_ca_sgm_v5a_f_prmc_h1,
+    "PARCASGM_v5a_GlobalRST_PosPrior_PRMC_MECDetach": model_kwargs_par_ca_sgm_v5a_f_prmc_mec,
+    "PARCASGM_v5a_GlobalRST_PosPrior_PRMC_MECJoint": model_kwargs_par_ca_sgm_v5a_f_prmc_mec,
+    "PARCASGM_v5a_GlobalRST_PosPrior_PRMC_MECShuffle": model_kwargs_par_ca_sgm_v5a_f_prmc_mec,
     "PARCASGM_v5a_GlobalRST_PosPrior_PRMC_GeometryAdaptive": model_kwargs_par_ca_sgm_v5a_f_prmc_geometry_adaptive,
     "PARCASGM_v5a_GlobalRST_PosPrior_PRMC_TaskAdapters": model_kwargs_par_ca_sgm_v5a_f_prmc_taskadapters,
     "PARCASGM_v5a_MSPCOC":  model_kwargs_par_ca_sgm_v5a_mspcoc,
