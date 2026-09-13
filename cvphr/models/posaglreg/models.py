@@ -764,6 +764,137 @@ class RSTGlobalContextFusion(nn.Module):
         return fused_descriptors
 
 
+class ContentDirectionMatching(nn.Module):
+    """Use content correspondences to aggregate cross-view directional evidence."""
+
+    def __init__(
+        self,
+        input_dim=256,
+        descriptor_dim=1024,
+        content_dim=32,
+        direction_groups=16,
+        relation_dim=128,
+        match_temperature=0.1,
+        prior_strength=0.5,
+    ):
+        super().__init__()
+        if content_dim <= 0 or content_dim % 8 != 0:
+            raise ValueError("content_dim must be positive and divisible by 8")
+        if direction_groups <= 0 or match_temperature <= 0:
+            raise ValueError("direction_groups and match_temperature must be positive")
+        if prior_strength < 0:
+            raise ValueError("prior_strength must be non-negative")
+
+        self.direction_groups = direction_groups
+        self.match_temperature = match_temperature
+        self.prior_strength = prior_strength
+        self.content_projector = nn.Sequential(
+            nn.Conv2d(input_dim, content_dim, 1, bias=False),
+            nn.GroupNorm(8, content_dim),
+            nn.GELU(),
+            nn.Conv2d(content_dim, content_dim, 1),
+        )
+        self.direction_projector = nn.Sequential(
+            nn.Conv2d(input_dim, direction_groups * 2, 1),
+            nn.GELU(),
+            nn.Conv2d(direction_groups * 2, direction_groups * 2, 1),
+        )
+        self.relation_projector = nn.Sequential(
+            nn.Linear(direction_groups * 2, relation_dim),
+            nn.GELU(),
+            nn.LayerNorm(relation_dim),
+        )
+        self.residual_projector = nn.Linear(relation_dim, descriptor_dim)
+        self.residual_scale = nn.Parameter(torch.zeros(1))
+        self.aux_heading = nn.Sequential(
+            nn.Linear(relation_dim, 64),
+            nn.GELU(),
+            nn.Linear(64, 2),
+            UnitL2Normalize(),
+        )
+
+    def forward(self, rst_maps, uav_map, tile_prior):
+        if rst_maps.dim() != 5 or rst_maps.size(1) != 4:
+            raise ValueError("Expected four RST maps [B, 4, C, H, W]")
+        if uav_map.shape != rst_maps[:, 0].shape:
+            raise ValueError("UAV map must match a single RST map")
+        if tile_prior.shape != (rst_maps.size(0), 4):
+            raise ValueError("Expected four PSG tile weights per sample")
+
+        batch_size, _, channels, height, width = rst_maps.shape
+        tile_tokens = height * width
+        rst_flat = rst_maps.reshape(batch_size * 4, channels, height, width)
+
+        rst_content = self.content_projector(rst_flat)
+        rst_content = rst_content.flatten(2).transpose(1, 2)
+        rst_content = rst_content.reshape(batch_size, 4 * tile_tokens, -1)
+        uav_content = self.content_projector(uav_map)
+        uav_content = uav_content.flatten(2).transpose(1, 2)
+        rst_content = F.normalize(rst_content, dim=-1)
+        uav_content = F.normalize(uav_content, dim=-1)
+
+        logits = torch.bmm(uav_content, rst_content.transpose(1, 2))
+        logits = logits / self.match_temperature
+        tile_bias = tile_prior.detach().clamp_min(1e-6).log()
+        tile_bias = tile_bias.repeat_interleave(tile_tokens, dim=1)
+        logits = logits + self.prior_strength * tile_bias[:, None, :]
+        matches = logits.softmax(dim=-1)
+
+        rst_direction = self.direction_projector(rst_flat)
+        rst_direction = rst_direction.flatten(2).transpose(1, 2)
+        rst_direction = rst_direction.reshape(
+            batch_size, 4, tile_tokens, self.direction_groups, 2
+        )
+        uav_direction = self.direction_projector(uav_map)
+        uav_direction = uav_direction.flatten(2).transpose(1, 2)
+        uav_direction = uav_direction.reshape(
+            batch_size, tile_tokens, self.direction_groups, 2
+        )
+        rst_direction = F.normalize(rst_direction, dim=-1, eps=1e-6)
+        uav_direction = F.normalize(uav_direction, dim=-1, eps=1e-6)
+
+        tile_relations = []
+        for tile_index in range(4):
+            weights = matches[:, :, tile_index * tile_tokens:(tile_index + 1) * tile_tokens]
+            token_mass = weights.sum(dim=-1)
+            matched = torch.bmm(
+                weights,
+                rst_direction[:, tile_index].reshape(batch_size, tile_tokens, -1),
+            )
+            matched = matched.reshape(
+                batch_size, tile_tokens, self.direction_groups, 2
+            )
+            matched = F.normalize(
+                matched / token_mass.clamp_min(1e-6)[:, :, None, None],
+                dim=-1,
+                eps=1e-6,
+            )
+            alignment = (uav_direction * matched).sum(dim=-1)
+            turn = (
+                uav_direction[..., 0] * matched[..., 1]
+                - uav_direction[..., 1] * matched[..., 0]
+            )
+            direction_relation = torch.stack((alignment, turn), dim=-1)
+            normalized_mass = token_mass / token_mass.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+            tile_relations.append(
+                (direction_relation * normalized_mass[:, :, None, None]).sum(dim=1)
+            )
+
+        tile_relations = torch.stack(tile_relations, dim=1)
+        tile_features = self.relation_projector(tile_relations.flatten(2))
+        tile_mass = matches.reshape(batch_size, tile_tokens, 4, tile_tokens)
+        tile_mass = tile_mass.sum(dim=(1, 3)) / tile_tokens
+        global_relation = (tile_features * tile_mass.unsqueeze(-1)).sum(dim=1)
+        heading_aux = self.aux_heading(global_relation)
+        residual = F.normalize(self.residual_projector(tile_features), dim=-1)
+        residual = self.residual_scale * residual
+        return residual, heading_aux, {
+            'tile_relation': tile_relations,
+            'tile_match_mass': tile_mass,
+            'cdm_residual_scale': self.residual_scale.detach(),
+        }
+
+
 class LocalCandidatePositionRefiner(nn.Module):
     """Refine a coarse RSB position with local RST-to-UAV feature matching."""
 
@@ -2335,6 +2466,121 @@ class PARCASGM_v5a_GlobalRST_PosPrior(PARCASGM_v5a_GlobalRST):
         if return_aux:
             return pos_pred, dir_pred, auxiliary
         return pos_pred, dir_pred
+
+
+class PARCASGM_v5a_GlobalRST_PosPrior_CDM(
+    PARCASGM_v5a_GlobalRST_PosPrior
+):
+    """Experiment F plus content-guided directional matching and CA feedback."""
+
+    model_name = 'phr5_f_cdm'
+    uses_heading_distribution_loss = True
+
+    def __init__(
+        self,
+        *args,
+        cdm_content_dim=32,
+        cdm_direction_groups=16,
+        cdm_relation_dim=128,
+        cdm_match_temperature=0.1,
+        cdm_prior_strength=0.5,
+        cdm_aux_heading_weight=0.1,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        if cdm_aux_heading_weight < 0:
+            raise ValueError("cdm_aux_heading_weight must be non-negative")
+        self.model_name = type(self).model_name
+        self.cdm_aux_heading_weight = float(cdm_aux_heading_weight)
+        self.cdm = ContentDirectionMatching(
+            input_dim=self.feature_dim,
+            descriptor_dim=self.feature_dim * self.num_clusters,
+            content_dim=cdm_content_dim,
+            direction_groups=cdm_direction_groups,
+            relation_dim=cdm_relation_dim,
+            match_temperature=cdm_match_temperature,
+            prior_strength=cdm_prior_strength,
+        )
+
+    def forward(
+        self, patches, debug_dir='', return_aux=False, attention_temperature=1.0
+    ):
+        if patches.dim() != 5 or patches.size(1) != 5:
+            raise ValueError(
+                f"Expected patches shaped [B, 5, C, H, W], got {tuple(patches.shape)}"
+            )
+
+        batch_size = patches.size(0)
+        sgm_outputs = [self.sgm(patches[:, index]) for index in range(5)]
+        original_rst = torch.stack(
+            [output['descriptor_flatten'] for output in sgm_outputs[:4]], dim=1
+        )
+        rst_maps = torch.stack(
+            [output['nl_feat'] for output in sgm_outputs[:4]], dim=1
+        )
+        uav_descriptor = sgm_outputs[4]['descriptor_flatten']
+        uav_map = sgm_outputs[4]['nl_feat']
+
+        fusion_output = self.rst_global_fusion(
+            rst_maps, original_rst, return_aux=return_aux
+        )
+        if return_aux:
+            global_rst, auxiliary = fusion_output
+        else:
+            global_rst = fusion_output
+        pos_prior, tile_weights = self.sim_pos_prior(
+            uav_descriptor,
+            global_rst,
+            temperature=attention_temperature,
+            return_weights=True,
+        )
+        direction_residual, heading_aux, cdm_aux = self.cdm(
+            rst_maps, uav_map, tile_weights
+        )
+
+        known_coords = uav_descriptor.new_tensor(
+            [[-1.0, -1.0], [-1.0, 1.0], [1.0, -1.0], [1.0, 1.0]]
+        )
+        coord_embs = self.coord_encoder(known_coords).unsqueeze(0).expand(
+            batch_size, -1, -1
+        )
+        ca_rst = original_rst + direction_residual
+        if self.add_patch_coord:
+            ca_rst = ca_rst + coord_embs
+        context = self.neighbors_cross_attn(uav_descriptor, ca_rst)
+        combined = torch.cat((uav_descriptor, context), dim=1)
+        position = self.pos_regressor(torch.cat((combined, pos_prior), dim=1))
+        heading = self.dir_regressor(combined)
+        if return_aux:
+            auxiliary.update(cdm_aux)
+            auxiliary.update({
+                'position_prior': pos_prior,
+                'attention_weights': tile_weights,
+                'heading_aux': heading_aux,
+                'final_heading': heading,
+            })
+            return position, heading, auxiliary
+        return position, heading
+
+    def compute_heading_losses(
+        self, auxiliary, target_heading, target_position=None
+    ):
+        del target_position
+        target_heading = target_heading.float()
+        final_heading = auxiliary['final_heading'].float()
+        heading_aux = auxiliary['heading_aux'].float()
+        final_loss = F.smooth_l1_loss(final_heading, target_heading)
+        auxiliary_loss = F.smooth_l1_loss(heading_aux, target_heading)
+        total = final_loss + self.cdm_aux_heading_weight * auxiliary_loss
+        target_unit = F.normalize(target_heading, dim=-1, eps=1e-6)
+        final_unit = F.normalize(final_heading, dim=-1, eps=1e-6)
+        return {
+            'total': total,
+            'final': final_loss,
+            'auxiliary': auxiliary_loss,
+            'correlation': (1.0 - (final_unit * target_unit).sum(dim=-1)).mean(),
+            'distribution': final_loss.new_zeros(()),
+        }
 
 
 class PARCASGM_v5a_GlobalRST_PosPrior_SGCDCA(
@@ -4563,6 +4809,16 @@ model_kwargs_par_ca_sgm_v5a_globalrst_posprior_lcpr1 = {
     'lcpr_gate_bias': -2.0,
 }
 
+model_kwargs_par_ca_sgm_v5a_f_cdm = {
+    **model_kwargs_par_ca_sgm_v5a_globalrst,
+    'cdm_content_dim': 32,
+    'cdm_direction_groups': 16,
+    'cdm_relation_dim': 128,
+    'cdm_match_temperature': 0.1,
+    'cdm_prior_strength': 0.5,
+    'cdm_aux_heading_weight': 0.1,
+}
+
 
 """****************************************************************************
 *                                                                             *
@@ -4589,6 +4845,7 @@ MODEL_CLASS_DICT = {
     "PARCASGM_v5a_MSRDCP_P5": PARCASGM_v5a_MSRDCP_P5,
     "PARCASGM_v5a_GlobalRST": PARCASGM_v5a_GlobalRST,
     "PARCASGM_v5a_GlobalRST_PosPrior": PARCASGM_v5a_GlobalRST_PosPrior,
+    "PARCASGM_v5a_GlobalRST_PosPrior_CDM": PARCASGM_v5a_GlobalRST_PosPrior_CDM,
     "PARCASGM_v5a_GlobalRST_PosPrior_SGCDCA": PARCASGM_v5a_GlobalRST_PosPrior_SGCDCA,
     "PARCASGM_v5a_GlobalRST_Quad": PARCASGM_v5a_GlobalRST_Quad,
     "PARCASGM_v5a_GlobalRST_Attn": PARCASGM_v5a_GlobalRST_Attn,
@@ -4614,6 +4871,7 @@ MODEL_KEYWARDS_DICT = {
     "PARCASGM_v5a_MSRDCP_P5": model_kwargs_par_ca_sgm_v5a_msrdcp_p5,
     "PARCASGM_v5a_GlobalRST": model_kwargs_par_ca_sgm_v5a_globalrst,
     "PARCASGM_v5a_GlobalRST_PosPrior": model_kwargs_par_ca_sgm_v5a_globalrst,
+    "PARCASGM_v5a_GlobalRST_PosPrior_CDM": model_kwargs_par_ca_sgm_v5a_f_cdm,
     "PARCASGM_v5a_GlobalRST_PosPrior_SGCDCA": model_kwargs_par_ca_sgm_v5a_f_sgcdca,
     "PARCASGM_v5a_GlobalRST_Quad": model_kwargs_par_ca_sgm_v5a_globalrst_quad,
     "PARCASGM_v5a_GlobalRST_Attn": model_kwargs_par_ca_sgm_v5a_globalrst_attn,
