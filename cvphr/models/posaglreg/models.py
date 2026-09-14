@@ -2468,6 +2468,110 @@ class PARCASGM_v5a_GlobalRST_PosPrior(PARCASGM_v5a_GlobalRST):
         return pos_pred, dir_pred
 
 
+class ContentSpatialMomentEncoding(nn.Module):
+    """Encode cluster geometry in local tile coordinates (x right, y down)."""
+
+    def __init__(self, feature_dim=256, hidden_dim=32):
+        super().__init__()
+        self.projector = nn.Sequential(
+            nn.Linear(5, hidden_dim), nn.GELU(),
+            nn.Linear(hidden_dim, feature_dim),
+        )
+        self.scale = nn.Parameter(torch.zeros(()))
+
+    @staticmethod
+    def spatial_moments(weights):
+        if weights.ndim != 4 or min(weights.shape[-2:]) < 1:
+            raise ValueError('Expected nonnegative weights [B, K, H, W]')
+        # Accumulate moments in float32, including under mixed precision.
+        weights = weights.float()
+        height, width = weights.shape[-2:]
+        x = 2 * (torch.arange(width, device=weights.device).float() + 0.5) / width - 1
+        y = 2 * (torch.arange(height, device=weights.device).float() + 0.5) / height - 1
+        yy, xx = torch.meshgrid(y, x, indexing='ij')
+        mass = weights.sum(dim=(-2, -1), keepdim=True)
+        valid = mass[..., 0, 0] > 1e-6
+        probability = weights / mass.clamp_min(1e-6)
+        mean_x = (probability * xx).sum(dim=(-2, -1))
+        mean_y = (probability * yy).sum(dim=(-2, -1))
+        dx = xx - mean_x[..., None, None]
+        dy = yy - mean_y[..., None, None]
+        moments = torch.stack((
+            mean_x, mean_y,
+            (probability * dx.square()).sum(dim=(-2, -1)),
+            (probability * dy.square()).sum(dim=(-2, -1)),
+            (probability * dx * dy).sum(dim=(-2, -1)),
+        ), dim=-1)
+        return moments * valid.unsqueeze(-1), valid
+
+    def forward(self, descriptors, weights):
+        moments, valid = self.spatial_moments(weights)
+        residual = self.projector(moments.to(descriptors.dtype))
+        residual = residual * valid.unsqueeze(-1)
+        enhanced = F.normalize(descriptors + self.scale * residual, dim=-1)
+        # Preserve an empty cluster exactly, rather than injecting MLP biases.
+        enhanced = torch.where(valid.unsqueeze(-1), enhanced, descriptors)
+        return enhanced, {'spatial_moments': moments, 'valid_clusters': valid}
+
+
+class PARCASGM_v5a_GlobalRST_PosPrior_CSME(PARCASGM_v5a_GlobalRST_PosPrior):
+    """F + cluster spatial moments in CA only; PSG and pose loss unchanged."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.model_name = 'phr5_f_csme'
+        self.csme = ContentSpatialMomentEncoding(self.sgm.module.centroids.size(1))
+
+    def forward(self, patches, debug_dir='', return_aux=False,
+                attention_temperature=1.0):
+        if patches.ndim != 5 or patches.size(1) != 5:
+            raise ValueError('Expected patches [B, 5, C, H, W]')
+        outputs = [self.sgm(patches[:, index]) for index in range(5)]
+        original_rst = torch.stack([o['descriptor_flatten'] for o in outputs[:4]], 1)
+        rst_maps = torch.stack([o['nl_feat'] for o in outputs[:4]], 1)
+        global_output = self.rst_global_fusion(rst_maps, original_rst, return_aux=return_aux)
+        if return_aux:
+            global_rst, auxiliary = global_output
+        else:
+            global_rst, auxiliary = global_output, {}
+        uav = outputs[4]['descriptor_flatten']
+        prior_output = self.sim_pos_prior(
+            uav, global_rst, temperature=attention_temperature, return_weights=return_aux,
+        )
+        if return_aux:
+            prior, attention = prior_output
+            auxiliary.update(attention_weights=attention, position_prior=prior,
+                             global_rst_descriptors=global_rst)
+        else:
+            prior = prior_output
+
+        descriptors, moments, validity = [], [], []
+        centroids = F.normalize(self.sgm.module.centroids, dim=1)
+        for output in outputs[:4]:
+            feature = output['nl_feat']
+            assignment = self.sgm.module.conv_node(feature).softmax(dim=1)
+            similarity = torch.einsum('kc,bchw->bkhw', centroids, feature).relu()
+            # Exactly the two factors used by CSMG before spatial summation.
+            enhanced, geometry = self.csme(output['descriptor'], assignment * similarity)
+            descriptors.append(F.normalize(enhanced.flatten(1), dim=1))
+            moments.append(geometry['spatial_moments'])
+            validity.append(geometry['valid_clusters'])
+        ca_rst = torch.stack(descriptors, dim=1)
+        if self.add_patch_coord:
+            coords = patches.new_tensor([[-1., -1.], [-1., 1.], [1., -1.], [1., 1.]])
+            ca_rst = ca_rst + self.coord_encoder(coords).unsqueeze(0)
+        context = self.neighbors_cross_attn(uav, ca_rst)
+        combined = torch.cat((uav, context), dim=1)
+        position = self.pos_regressor(torch.cat((combined, prior), dim=1))
+        heading = self.dir_regressor(combined)
+        if return_aux:
+            auxiliary.update(spatial_moments=torch.stack(moments, dim=1),
+                             valid_clusters=torch.stack(validity, dim=1),
+                             csme_scale=self.csme.scale.detach())
+            return position, heading, auxiliary
+        return position, heading
+
+
 class PARCASGM_v5a_GlobalRST_PosPrior_CDM(
     PARCASGM_v5a_GlobalRST_PosPrior
 ):
@@ -4846,6 +4950,7 @@ MODEL_CLASS_DICT = {
     "PARCASGM_v5a_GlobalRST": PARCASGM_v5a_GlobalRST,
     "PARCASGM_v5a_GlobalRST_PosPrior": PARCASGM_v5a_GlobalRST_PosPrior,
     "PARCASGM_v5a_GlobalRST_PosPrior_CDM": PARCASGM_v5a_GlobalRST_PosPrior_CDM,
+    "PARCASGM_v5a_GlobalRST_PosPrior_CSME": PARCASGM_v5a_GlobalRST_PosPrior_CSME,
     "PARCASGM_v5a_GlobalRST_PosPrior_SGCDCA": PARCASGM_v5a_GlobalRST_PosPrior_SGCDCA,
     "PARCASGM_v5a_GlobalRST_Quad": PARCASGM_v5a_GlobalRST_Quad,
     "PARCASGM_v5a_GlobalRST_Attn": PARCASGM_v5a_GlobalRST_Attn,
@@ -4872,6 +4977,7 @@ MODEL_KEYWARDS_DICT = {
     "PARCASGM_v5a_GlobalRST": model_kwargs_par_ca_sgm_v5a_globalrst,
     "PARCASGM_v5a_GlobalRST_PosPrior": model_kwargs_par_ca_sgm_v5a_globalrst,
     "PARCASGM_v5a_GlobalRST_PosPrior_CDM": model_kwargs_par_ca_sgm_v5a_f_cdm,
+    "PARCASGM_v5a_GlobalRST_PosPrior_CSME": dict(model_kwargs_par_ca_sgm_v5a_globalrst),
     "PARCASGM_v5a_GlobalRST_PosPrior_SGCDCA": model_kwargs_par_ca_sgm_v5a_f_sgcdca,
     "PARCASGM_v5a_GlobalRST_Quad": model_kwargs_par_ca_sgm_v5a_globalrst_quad,
     "PARCASGM_v5a_GlobalRST_Attn": model_kwargs_par_ca_sgm_v5a_globalrst_attn,
