@@ -2579,6 +2579,7 @@ class PARCASGM_v5a_GlobalRST_PosPrior_CDM(
 
     model_name = 'phr5_f_cdm'
     uses_heading_distribution_loss = True
+    use_cdm_residual = True
 
     def __init__(
         self,
@@ -2648,7 +2649,9 @@ class PARCASGM_v5a_GlobalRST_PosPrior_CDM(
         coord_embs = self.coord_encoder(known_coords).unsqueeze(0).expand(
             batch_size, -1, -1
         )
-        ca_rst = original_rst + direction_residual
+        ca_rst = original_rst
+        if self.use_cdm_residual:
+            ca_rst = ca_rst + direction_residual
         if self.add_patch_coord:
             ca_rst = ca_rst + coord_embs
         context = self.neighbors_cross_attn(uav_descriptor, ca_rst)
@@ -2674,8 +2677,12 @@ class PARCASGM_v5a_GlobalRST_PosPrior_CDM(
         final_heading = auxiliary['final_heading'].float()
         heading_aux = auxiliary['heading_aux'].float()
         final_loss = F.smooth_l1_loss(final_heading, target_heading)
-        auxiliary_loss = F.smooth_l1_loss(heading_aux, target_heading)
-        total = final_loss + self.cdm_aux_heading_weight * auxiliary_loss
+        if self.cdm_aux_heading_weight > 0:
+            auxiliary_loss = F.smooth_l1_loss(heading_aux, target_heading)
+            total = final_loss + self.cdm_aux_heading_weight * auxiliary_loss
+        else:
+            auxiliary_loss = final_loss.new_zeros(())
+            total = final_loss
         target_unit = F.normalize(target_heading, dim=-1, eps=1e-6)
         final_unit = F.normalize(final_heading, dim=-1, eps=1e-6)
         return {
@@ -2685,6 +2692,27 @@ class PARCASGM_v5a_GlobalRST_PosPrior_CDM(
             'correlation': (1.0 - (final_unit * target_unit).sum(dim=-1)).mean(),
             'distribution': final_loss.new_zeros(()),
         }
+
+
+class PARCASGM_v5a_GlobalRST_PosPrior_CDMResidualOnly(
+    PARCASGM_v5a_GlobalRST_PosPrior_CDM
+):
+    """F + CDM-to-CA residual, without CDM auxiliary heading supervision."""
+
+    model_name = 'phr5_f_cdm_residual_only'
+
+    def __init__(self, *args, **kwargs):
+        kwargs['cdm_aux_heading_weight'] = 0.0
+        super().__init__(*args, **kwargs)
+
+
+class PARCASGM_v5a_GlobalRST_PosPrior_CDMAuxOnly(
+    PARCASGM_v5a_GlobalRST_PosPrior_CDM
+):
+    """F + CDM auxiliary heading supervision, without CA residual feedback."""
+
+    model_name = 'phr5_f_cdm_aux_only'
+    use_cdm_residual = False
 
 
 class PARCASGM_v5a_GlobalRST_PosPrior_SGCDCA(
@@ -4922,6 +4950,10 @@ model_kwargs_par_ca_sgm_v5a_f_cdm = {
     'cdm_prior_strength': 0.5,
     'cdm_aux_heading_weight': 0.1,
 }
+model_kwargs_par_ca_sgm_v5a_f_cdm_residual_only = {
+    **model_kwargs_par_ca_sgm_v5a_f_cdm,
+    'cdm_aux_heading_weight': 0.0,
+}
 
 
 """****************************************************************************
@@ -4950,6 +4982,8 @@ MODEL_CLASS_DICT = {
     "PARCASGM_v5a_GlobalRST": PARCASGM_v5a_GlobalRST,
     "PARCASGM_v5a_GlobalRST_PosPrior": PARCASGM_v5a_GlobalRST_PosPrior,
     "PARCASGM_v5a_GlobalRST_PosPrior_CDM": PARCASGM_v5a_GlobalRST_PosPrior_CDM,
+    "PARCASGM_v5a_GlobalRST_PosPrior_CDMResidualOnly": PARCASGM_v5a_GlobalRST_PosPrior_CDMResidualOnly,
+    "PARCASGM_v5a_GlobalRST_PosPrior_CDMAuxOnly": PARCASGM_v5a_GlobalRST_PosPrior_CDMAuxOnly,
     "PARCASGM_v5a_GlobalRST_PosPrior_CSME": PARCASGM_v5a_GlobalRST_PosPrior_CSME,
     "PARCASGM_v5a_GlobalRST_PosPrior_SGCDCA": PARCASGM_v5a_GlobalRST_PosPrior_SGCDCA,
     "PARCASGM_v5a_GlobalRST_Quad": PARCASGM_v5a_GlobalRST_Quad,
@@ -4977,6 +5011,8 @@ MODEL_KEYWARDS_DICT = {
     "PARCASGM_v5a_GlobalRST": model_kwargs_par_ca_sgm_v5a_globalrst,
     "PARCASGM_v5a_GlobalRST_PosPrior": model_kwargs_par_ca_sgm_v5a_globalrst,
     "PARCASGM_v5a_GlobalRST_PosPrior_CDM": model_kwargs_par_ca_sgm_v5a_f_cdm,
+    "PARCASGM_v5a_GlobalRST_PosPrior_CDMResidualOnly": model_kwargs_par_ca_sgm_v5a_f_cdm_residual_only,
+    "PARCASGM_v5a_GlobalRST_PosPrior_CDMAuxOnly": model_kwargs_par_ca_sgm_v5a_f_cdm,
     "PARCASGM_v5a_GlobalRST_PosPrior_CSME": dict(model_kwargs_par_ca_sgm_v5a_globalrst),
     "PARCASGM_v5a_GlobalRST_PosPrior_SGCDCA": model_kwargs_par_ca_sgm_v5a_f_sgcdca,
     "PARCASGM_v5a_GlobalRST_Quad": model_kwargs_par_ca_sgm_v5a_globalrst_quad,
