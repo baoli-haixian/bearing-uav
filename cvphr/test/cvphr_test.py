@@ -291,7 +291,9 @@ def test_par(dataset_dir,
                 loss, loss_pos, loss_dir = criterion(
                     pos_pred, coords,
                     dir_pred, agl_coords)
-            elif loss_type in {'mspcoc', 'gprvh', 'prmc', 'sgcdca'}:
+            elif loss_type in {
+                'mspcoc', 'gprvh', 'prmc', 'c8pose', 'sgcdca'
+            }:
                 loss_pos = criterion(pos_pred, coords)
                 loss_dir = model.compute_heading_losses(
                     auxiliary, agl_coords, target_position=coords

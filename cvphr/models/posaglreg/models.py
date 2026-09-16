@@ -421,6 +421,287 @@ class ParallelRotationMarginalizedHeadingHead(nn.Module):
         }
 
 
+class CyclicEquivariantPoseVolume(nn.Module):
+    """Lightweight C_N orbit encoder with joint position-orientation matching."""
+
+    def __init__(
+        self,
+        feature_dim=32,
+        spatial_size=8,
+        num_rotations=8,
+        position_temperature=0.2,
+        orientation_temperature=0.1,
+        residual_hidden_dim=32,
+    ):
+        super().__init__()
+        if (
+            feature_dim <= 0
+            or feature_dim % 8 != 0
+            or spatial_size <= 1
+            or num_rotations < 4
+        ):
+            raise ValueError(
+                "Cyclic pose-volume dimensions must be positive and "
+                "feature_dim must be divisible by 8"
+            )
+        if position_temperature <= 0 or orientation_temperature <= 0:
+            raise ValueError("Cyclic pose-volume temperatures must be positive")
+
+        self.feature_dim = int(feature_dim)
+        self.spatial_size = int(spatial_size)
+        self.num_rotations = int(num_rotations)
+        self.position_temperature = float(position_temperature)
+        self.orientation_temperature = float(orientation_temperature)
+
+        stem_dim = max(16, feature_dim // 2)
+        self.encoder = nn.Sequential(
+            nn.Conv2d(3, stem_dim, kernel_size=7, stride=4, padding=3, bias=False),
+            nn.GroupNorm(4, stem_dim),
+            nn.GELU(),
+            nn.Conv2d(
+                stem_dim,
+                feature_dim,
+                kernel_size=3,
+                stride=2,
+                padding=1,
+                bias=False,
+            ),
+            nn.GroupNorm(8, feature_dim),
+            nn.GELU(),
+            nn.Conv2d(
+                feature_dim,
+                feature_dim,
+                kernel_size=3,
+                stride=2,
+                padding=1,
+                groups=feature_dim,
+                bias=False,
+            ),
+            nn.GELU(),
+        )
+        angles = torch.arange(num_rotations, dtype=torch.float32)
+        angles = angles * (2.0 * math.pi / num_rotations)
+        self.register_buffer('rotation_angles', angles)
+        self.register_buffer(
+            'heading_basis', torch.stack((angles.cos(), angles.sin()), dim=-1)
+        )
+        self.residual_head = nn.Sequential(
+            nn.Linear(num_rotations, residual_hidden_dim),
+            nn.GELU(),
+            nn.Linear(residual_hidden_dim, 1),
+        )
+        nn.init.zeros_(self.residual_head[-1].weight)
+        nn.init.zeros_(self.residual_head[-1].bias)
+
+    def _rotate_bank(self, images):
+        batch_size, channels, height, width = images.shape
+        angles = self.rotation_angles.to(device=images.device, dtype=images.dtype)
+        cosine, sine = angles.cos(), angles.sin()
+        matrices = torch.zeros(
+            self.num_rotations, 2, 3, device=images.device, dtype=images.dtype
+        )
+        matrices[:, 0, 0] = cosine
+        matrices[:, 0, 1] = -sine
+        matrices[:, 1, 0] = sine
+        matrices[:, 1, 1] = cosine
+        matrices = matrices.unsqueeze(0).expand(batch_size, -1, -1, -1)
+        matrices = matrices.reshape(batch_size * self.num_rotations, 2, 3)
+        expanded = images[:, None].expand(
+            -1, self.num_rotations, -1, -1, -1
+        ).reshape(
+            batch_size * self.num_rotations, channels, height, width
+        )
+        grid = F.affine_grid(matrices, expanded.shape, align_corners=False)
+        return F.grid_sample(
+            expanded,
+            grid,
+            mode='bilinear',
+            padding_mode='zeros',
+            align_corners=False,
+        )
+
+    def _canonicalize(self, features, batch_size):
+        _, channels, height, width = features.shape
+        angles = self.rotation_angles.to(
+            device=features.device, dtype=features.dtype
+        )
+        cosine, sine = angles.cos(), angles.sin()
+        matrices = torch.zeros(
+            self.num_rotations, 2, 3,
+            device=features.device,
+            dtype=features.dtype,
+        )
+        # Inverse-warp each orbit element back to the original image frame.
+        matrices[:, 0, 0] = cosine
+        matrices[:, 0, 1] = sine
+        matrices[:, 1, 0] = -sine
+        matrices[:, 1, 1] = cosine
+        matrices = matrices.unsqueeze(0).expand(batch_size, -1, -1, -1)
+        matrices = matrices.reshape(batch_size * self.num_rotations, 2, 3)
+        grid = F.affine_grid(matrices, features.shape, align_corners=False)
+        canonical = F.grid_sample(
+            features,
+            grid,
+            mode='bilinear',
+            padding_mode='zeros',
+            align_corners=False,
+        )
+        canonical = F.adaptive_avg_pool2d(
+            canonical, (self.spatial_size, self.spatial_size)
+        )
+        return canonical.reshape(
+            batch_size,
+            self.num_rotations,
+            channels,
+            self.spatial_size,
+            self.spatial_size,
+        ).permute(0, 2, 1, 3, 4).contiguous()
+
+    def encode_group(self, images):
+        """Encode an image orbit as [B, C, rotations, H, W]."""
+        if images.dim() != 4 or images.size(1) != 3:
+            raise ValueError("Cyclic encoder expects RGB images [B, 3, H, W]")
+        batch_size = images.size(0)
+        return self._canonicalize(
+            self.encoder(self._rotate_bank(images)), batch_size
+        )
+
+    @staticmethod
+    def build_group_mosaic(rst_group):
+        if rst_group.dim() != 6 or rst_group.size(1) != 4:
+            raise ValueError("Expected four RST group maps [B, 4, C, K, H, W]")
+        top = torch.cat((rst_group[:, 0], rst_group[:, 1]), dim=-1)
+        bottom = torch.cat((rst_group[:, 2], rst_group[:, 3]), dim=-1)
+        return torch.cat((top, bottom), dim=-2)
+
+    def relative_correlation(self, rst_mosaic, uav_group):
+        """Build [B, relative-angle, y, x] normalized correlation volume."""
+        if rst_mosaic.dim() != 5 or uav_group.dim() != 5:
+            raise ValueError("Group correlation expects [B, C, K, H, W]")
+        if rst_mosaic.shape[:3] != uav_group.shape[:3]:
+            raise ValueError("RST and UAV group channel dimensions must match")
+        batch_size, channels, rotations, height, width = uav_group.shape
+        if rotations != self.num_rotations or height != width:
+            raise ValueError("Unexpected cyclic UAV feature dimensions")
+
+        mosaic_height, mosaic_width = rst_mosaic.shape[-2:]
+        response_height = mosaic_height - height + 1
+        response_width = mosaic_width - width + 1
+        if response_height <= 0 or response_width <= 0:
+            raise ValueError("RST group mosaic must be larger than the UAV template")
+
+        rst_flat = rst_mosaic.permute(0, 2, 1, 3, 4).reshape(
+            batch_size * rotations, channels, mosaic_height, mosaic_width
+        )
+        windows = F.unfold(rst_flat, kernel_size=(height, width), stride=1)
+        windows = windows.reshape(
+            batch_size, rotations, channels * height * width, -1
+        )
+        templates = uav_group.permute(0, 2, 1, 3, 4).reshape(
+            batch_size, rotations, channels * height * width
+        )
+        template_norm = templates.norm(dim=-1).clamp_min(1e-6)
+
+        responses = []
+        for offset in range(rotations):
+            shifted_windows = torch.roll(windows, shifts=-offset, dims=1)
+            numerator = torch.einsum(
+                'bkd,bkdn->bkn', templates, shifted_windows
+            )
+            window_norm = shifted_windows.square().sum(dim=2).clamp_min(1e-8).sqrt()
+            score = numerator / (template_norm.unsqueeze(-1) * window_norm)
+            responses.append(score.mean(dim=1))
+        return torch.stack(responses, dim=1).reshape(
+            batch_size,
+            rotations,
+            response_height,
+            response_width,
+        )
+
+    def forward(self, rst_images, uav_image):
+        if rst_images.dim() != 5 or rst_images.size(1) != 4:
+            raise ValueError("Expected four RST images [B, 4, 3, H, W]")
+        if uav_image.dim() != 4 or rst_images.size(0) != uav_image.size(0):
+            raise ValueError("RST and UAV image batches must match")
+
+        batch_size = rst_images.size(0)
+        rst_group = self.encode_group(
+            rst_images.reshape(-1, *rst_images.shape[2:])
+        ).reshape(
+            batch_size,
+            4,
+            self.feature_dim,
+            self.num_rotations,
+            self.spatial_size,
+            self.spatial_size,
+        )
+        uav_group = self.encode_group(uav_image)
+        rst_mosaic = self.build_group_mosaic(rst_group)
+        response = self.relative_correlation(rst_mosaic, uav_group)
+
+        position_logits = self.position_temperature * torch.logsumexp(
+            response / self.position_temperature, dim=1
+        )
+        position_probability = torch.softmax(position_logits.flatten(1), dim=-1)
+        response_height, response_width = position_logits.shape[-2:]
+        grid_y = torch.linspace(
+            -1.0, 1.0, response_height,
+            device=response.device,
+            dtype=response.dtype,
+        )
+        grid_x = torch.linspace(
+            -1.0, 1.0, response_width,
+            device=response.device,
+            dtype=response.dtype,
+        )
+        yy, xx = torch.meshgrid(grid_y, grid_x, indexing='ij')
+        coordinate_grid = torch.stack((xx, yy), dim=-1).reshape(-1, 2)
+        position = position_probability @ coordinate_grid
+
+        spatial_probability = position_probability.reshape(
+            batch_size, 1, response_height, response_width
+        )
+        orientation_logits = (
+            response * spatial_probability
+        ).flatten(2).sum(dim=-1)
+        orientation_probability = torch.softmax(
+            orientation_logits / self.orientation_temperature, dim=-1
+        )
+        basis = self.heading_basis.to(
+            device=response.device, dtype=response.dtype
+        )
+        coarse_heading = F.normalize(
+            orientation_probability @ basis, p=2, dim=-1, eps=1e-6
+        )
+        residual_limit = math.pi / self.num_rotations
+        residual = residual_limit * torch.tanh(
+            self.residual_head(orientation_probability)
+        ).squeeze(-1)
+        cos_residual, sin_residual = residual.cos(), residual.sin()
+        heading = torch.stack(
+            (
+                cos_residual * coarse_heading[:, 0]
+                - sin_residual * coarse_heading[:, 1],
+                sin_residual * coarse_heading[:, 0]
+                + cos_residual * coarse_heading[:, 1],
+            ),
+            dim=-1,
+        )
+        heading = F.normalize(heading, p=2, dim=-1, eps=1e-6)
+        return position, heading, {
+            'pose_volume': response,
+            'position_logits': position_logits,
+            'position_probability': position_probability.reshape(
+                batch_size, response_height, response_width
+            ),
+            'cyclic_position': position,
+            'orientation_logits': orientation_logits,
+            'orientation_probability': orientation_probability,
+            'cyclic_heading': heading,
+            'heading_residual': residual,
+        }
+
+
 class GeometryAdaptiveRotationMarginalizedHeadingHead(
     ParallelRotationMarginalizedHeadingHead
 ):
@@ -2466,6 +2747,187 @@ class PARCASGM_v5a_GlobalRST_PosPrior(PARCASGM_v5a_GlobalRST):
         if return_aux:
             return pos_pred, dir_pred, auxiliary
         return pos_pred, dir_pred
+
+
+class PARCASGM_v5a_GlobalRST_PosPrior_C8Pose(
+    PARCASGM_v5a_GlobalRST_PosPrior
+):
+    """Experiment F plus a parallel lightweight C8 joint pose-volume branch."""
+
+    model_name = 'phr5_f_c8pose'
+    default_loss_type = 'c8pose'
+    uses_heading_distribution_loss = True
+
+    def __init__(
+        self,
+        *args,
+        c8_feature_dim=32,
+        c8_spatial_size=8,
+        c8_num_rotations=8,
+        c8_position_temperature=0.2,
+        c8_orientation_temperature=0.1,
+        c8_residual_hidden_dim=32,
+        c8_gate_bias=-2.0,
+        c8_heading_kappa=4.0,
+        c8_heading_distribution_weight=0.05,
+        c8_heading_vector_weight=1.0,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        if c8_heading_kappa <= 0:
+            raise ValueError("C8 heading kappa must be positive")
+        if min(
+            c8_heading_distribution_weight, c8_heading_vector_weight
+        ) < 0:
+            raise ValueError("C8 heading loss weights must be non-negative")
+
+        self.model_name = type(self).model_name
+        self.c8_heading_kappa = float(c8_heading_kappa)
+        self.c8_heading_distribution_weight = float(
+            c8_heading_distribution_weight
+        )
+        self.c8_heading_vector_weight = float(c8_heading_vector_weight)
+        self.c8_pose_branch = CyclicEquivariantPoseVolume(
+            feature_dim=c8_feature_dim,
+            spatial_size=c8_spatial_size,
+            num_rotations=c8_num_rotations,
+            position_temperature=c8_position_temperature,
+            orientation_temperature=c8_orientation_temperature,
+            residual_hidden_dim=c8_residual_hidden_dim,
+        )
+        self.c8_position_gate_logit = nn.Parameter(
+            torch.tensor(float(c8_gate_bias))
+        )
+        self.c8_heading_gate_logit = nn.Parameter(
+            torch.tensor(float(c8_gate_bias))
+        )
+
+    def forward(
+        self,
+        patches,
+        debug_dir='',
+        return_aux=False,
+        attention_temperature=1.0,
+    ):
+        del debug_dir
+        if patches.dim() != 5 or patches.size(1) != 5:
+            raise ValueError(
+                f"Expected patches shaped [B, 5, C, H, W], got {tuple(patches.shape)}"
+            )
+
+        batch_size = patches.size(0)
+        sgm_outputs = [self.sgm(patches[:, index]) for index in range(5)]
+        original_rst_descriptors = torch.stack(
+            [output['descriptor_flatten'] for output in sgm_outputs[:4]], dim=1
+        )
+        rst_maps = torch.stack(
+            [output['nl_feat'] for output in sgm_outputs[:4]], dim=1
+        )
+        global_rst_descriptors, global_auxiliary = self.rst_global_fusion(
+            rst_maps, original_rst_descriptors, return_aux=True
+        )
+        uav_descriptor = sgm_outputs[4]['descriptor_flatten']
+
+        known_coords = torch.tensor(
+            [[-1.0, -1.0], [-1.0, 1.0], [1.0, -1.0], [1.0, 1.0]],
+            dtype=patches.dtype,
+            device=patches.device,
+        )
+        coord_embs = self.coord_encoder(known_coords).unsqueeze(0).expand(
+            batch_size, -1, -1
+        )
+        f_position_prior, attention_weights = self.sim_pos_prior(
+            uav_descriptor,
+            global_rst_descriptors,
+            temperature=attention_temperature,
+            return_weights=True,
+        )
+        cyclic_position, cyclic_heading, cyclic_auxiliary = self.c8_pose_branch(
+            patches[:, :4], patches[:, 4]
+        )
+
+        position_gate = torch.sigmoid(self.c8_position_gate_logit)
+        fused_position_prior = (
+            (1.0 - position_gate) * f_position_prior
+            + position_gate * cyclic_position
+        )
+
+        cross_attention_features = original_rst_descriptors
+        if self.add_patch_coord:
+            cross_attention_features = cross_attention_features + coord_embs
+        context = self.neighbors_cross_attn(
+            uav_descriptor, cross_attention_features
+        )
+        combined = torch.cat((uav_descriptor, context), dim=1)
+        position = self.pos_regressor(
+            torch.cat((combined, fused_position_prior), dim=1)
+        )
+
+        official_heading = F.normalize(
+            self.dir_regressor(combined), p=2, dim=-1, eps=1e-6
+        )
+        heading_gate = torch.sigmoid(self.c8_heading_gate_logit)
+        heading = F.normalize(
+            (1.0 - heading_gate) * official_heading
+            + heading_gate * cyclic_heading,
+            p=2,
+            dim=-1,
+            eps=1e-6,
+        )
+
+        if not return_aux:
+            return position, heading
+        auxiliary = dict(global_auxiliary)
+        auxiliary.update(cyclic_auxiliary)
+        auxiliary.update(
+            {
+                'attention_weights': attention_weights,
+                'position_prior': fused_position_prior,
+                'f_position_prior': f_position_prior,
+                'global_rst_descriptors': global_rst_descriptors,
+                'official_heading': official_heading,
+                'final_heading': heading,
+                'c8_position_gate': position_gate,
+                'c8_heading_gate': heading_gate,
+            }
+        )
+        return position, heading, auxiliary
+
+    def compute_heading_losses(
+        self, auxiliary, target_heading, target_position=None
+    ):
+        del target_position
+        probability = auxiliary['orientation_probability'].float()
+        target_heading = F.normalize(
+            target_heading.float(), p=2, dim=-1, eps=1e-6
+        )
+        target_angle = torch.atan2(target_heading[:, 1], target_heading[:, 0])
+        basis = self.c8_pose_branch.heading_basis.float()
+        bin_angles = torch.atan2(basis[:, 1], basis[:, 0])
+        circular_offset = bin_angles.unsqueeze(0) - target_angle.unsqueeze(1)
+        soft_target = torch.softmax(
+            self.c8_heading_kappa * torch.cos(circular_offset), dim=-1
+        )
+        distribution = -(
+            soft_target * probability.clamp_min(1e-8).log()
+        ).sum(dim=-1).mean()
+        final_heading = F.normalize(
+            auxiliary['final_heading'].float(), p=2, dim=-1, eps=1e-6
+        )
+        vector = F.smooth_l1_loss(final_heading, target_heading)
+        correlation = (
+            1.0 - (final_heading * target_heading).sum(dim=-1)
+        ).mean()
+        total = (
+            self.c8_heading_vector_weight * vector
+            + self.c8_heading_distribution_weight * distribution
+        )
+        return {
+            'distribution': distribution,
+            'correlation': correlation,
+            'final': vector,
+            'total': total,
+        }
 
 
 class ContentSpatialMomentEncoding(nn.Module):
@@ -4783,6 +5245,20 @@ model_kwargs_par_ca_sgm_v5a_globalrst = {
     'global_dropout': 0.1,
 }
 
+model_kwargs_par_ca_sgm_v5a_f_c8pose = {
+    **model_kwargs_par_ca_sgm_v5a_globalrst,
+    'c8_feature_dim': 32,
+    'c8_spatial_size': 8,
+    'c8_num_rotations': 8,
+    'c8_position_temperature': 0.2,
+    'c8_orientation_temperature': 0.1,
+    'c8_residual_hidden_dim': 32,
+    'c8_gate_bias': -2.0,
+    'c8_heading_kappa': 4.0,
+    'c8_heading_distribution_weight': 0.05,
+    'c8_heading_vector_weight': 1.0,
+}
+
 model_kwargs_par_ca_sgm_v5a_f_sgcdca = {
     **model_kwargs_par_ca_sgm_v5a_globalrst,
     'heading_direction_dim': 64,
@@ -4981,6 +5457,7 @@ MODEL_CLASS_DICT = {
     "PARCASGM_v5a_MSRDCP_P5": PARCASGM_v5a_MSRDCP_P5,
     "PARCASGM_v5a_GlobalRST": PARCASGM_v5a_GlobalRST,
     "PARCASGM_v5a_GlobalRST_PosPrior": PARCASGM_v5a_GlobalRST_PosPrior,
+    "PARCASGM_v5a_GlobalRST_PosPrior_C8Pose": PARCASGM_v5a_GlobalRST_PosPrior_C8Pose,
     "PARCASGM_v5a_GlobalRST_PosPrior_CDM": PARCASGM_v5a_GlobalRST_PosPrior_CDM,
     "PARCASGM_v5a_GlobalRST_PosPrior_CDMResidualOnly": PARCASGM_v5a_GlobalRST_PosPrior_CDMResidualOnly,
     "PARCASGM_v5a_GlobalRST_PosPrior_CDMAuxOnly": PARCASGM_v5a_GlobalRST_PosPrior_CDMAuxOnly,
@@ -5010,6 +5487,7 @@ MODEL_KEYWARDS_DICT = {
     "PARCASGM_v5a_MSRDCP_P5": model_kwargs_par_ca_sgm_v5a_msrdcp_p5,
     "PARCASGM_v5a_GlobalRST": model_kwargs_par_ca_sgm_v5a_globalrst,
     "PARCASGM_v5a_GlobalRST_PosPrior": model_kwargs_par_ca_sgm_v5a_globalrst,
+    "PARCASGM_v5a_GlobalRST_PosPrior_C8Pose": model_kwargs_par_ca_sgm_v5a_f_c8pose,
     "PARCASGM_v5a_GlobalRST_PosPrior_CDM": model_kwargs_par_ca_sgm_v5a_f_cdm,
     "PARCASGM_v5a_GlobalRST_PosPrior_CDMResidualOnly": model_kwargs_par_ca_sgm_v5a_f_cdm_residual_only,
     "PARCASGM_v5a_GlobalRST_PosPrior_CDMAuxOnly": model_kwargs_par_ca_sgm_v5a_f_cdm,

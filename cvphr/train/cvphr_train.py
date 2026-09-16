@@ -233,6 +233,12 @@ def train_par(
             'Using P-RMC heading objective: SmoothL1 heading vector + '
             'von Mises rotation-distribution loss'
         )
+    elif loss_type == 'c8pose':
+        criterion = nn.SmoothL1Loss()
+        print(
+            'Using C8 pose-volume objective: SmoothL1 position/heading + '
+            'circular rotation-distribution loss'
+        )
     elif loss_type == 'sgcdca':
         criterion = nn.SmoothL1Loss()
         print(
