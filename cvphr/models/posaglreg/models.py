@@ -72,6 +72,212 @@ class UnitL2Normalize(nn.Module):
         return F.normalize(vector, p=2, dim=-1, eps=self.eps)
 
 
+class ImplicitDirectionalRelationAdapter(nn.Module):
+    """Learn cross-view heading relations without discrete angle hypotheses."""
+
+    def __init__(
+        self,
+        input_dim=256,
+        descriptor_dim=1024,
+        relation_dim=128,
+        spatial_size=8,
+        num_queries=4,
+        num_heads=4,
+        dropout=0.1,
+        gate_bias=-2.0,
+    ):
+        super().__init__()
+        if relation_dim <= 0 or relation_dim % num_heads != 0:
+            raise ValueError("relation_dim must be positive and divisible by num_heads")
+        if spatial_size <= 1 or num_queries <= 0:
+            raise ValueError("spatial_size and num_queries must be positive")
+
+        self.relation_dim = int(relation_dim)
+        self.spatial_size = int(spatial_size)
+        self.num_queries = int(num_queries)
+
+        self.input_projection = nn.Sequential(
+            nn.Conv2d(input_dim, relation_dim, kernel_size=1, bias=False),
+            nn.GroupNorm(8, relation_dim),
+            nn.GELU(),
+        )
+        self.horizontal = nn.Conv2d(
+            relation_dim,
+            relation_dim,
+            kernel_size=(1, 5),
+            padding=(0, 2),
+            groups=relation_dim,
+            bias=False,
+        )
+        self.vertical = nn.Conv2d(
+            relation_dim,
+            relation_dim,
+            kernel_size=(5, 1),
+            padding=(2, 0),
+            groups=relation_dim,
+            bias=False,
+        )
+        self.local = nn.Conv2d(
+            relation_dim,
+            relation_dim,
+            kernel_size=3,
+            padding=1,
+            groups=relation_dim,
+            bias=False,
+        )
+        self.direction_fusion = nn.Sequential(
+            nn.Conv2d(3 * relation_dim, relation_dim, kernel_size=1, bias=False),
+            nn.GroupNorm(8, relation_dim),
+            nn.GELU(),
+        )
+        self.token_pool = nn.AdaptiveAvgPool2d((spatial_size, spatial_size))
+        self.position_embedding = nn.Parameter(
+            torch.zeros(1, spatial_size * spatial_size, relation_dim)
+        )
+        self.heading_queries = nn.Parameter(
+            torch.zeros(1, num_queries, relation_dim)
+        )
+        self.relation_attention = nn.MultiheadAttention(
+            relation_dim,
+            num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.query_norm = nn.LayerNorm(relation_dim)
+        self.relation_projection = nn.Sequential(
+            nn.Linear(4 * relation_dim, relation_dim),
+            nn.GELU(),
+            nn.LayerNorm(relation_dim),
+        )
+        self.heading_regressor = nn.Sequential(
+            nn.Linear(relation_dim, relation_dim // 2),
+            nn.GELU(),
+            nn.Linear(relation_dim // 2, 2),
+        )
+        self.heading_gate = nn.Sequential(
+            nn.Linear(2 * descriptor_dim + relation_dim, relation_dim),
+            nn.GELU(),
+            nn.Linear(relation_dim, 1),
+        )
+
+        nn.init.trunc_normal_(self.position_embedding, std=0.02)
+        nn.init.trunc_normal_(self.heading_queries, std=0.02)
+        nn.init.zeros_(self.heading_gate[-1].weight)
+        nn.init.constant_(self.heading_gate[-1].bias, gate_bias)
+
+    def _direction_tokens(self, feature):
+        projected = self.input_projection(feature)
+        directional = self.direction_fusion(
+            torch.cat(
+                (
+                    self.horizontal(projected),
+                    self.vertical(projected),
+                    self.local(projected),
+                ),
+                dim=1,
+            )
+        )
+        directional = projected + directional
+        tokens = self.token_pool(directional).flatten(2).transpose(1, 2)
+        return tokens + self.position_embedding.to(dtype=tokens.dtype)
+
+    def _implicit_heading(self, rst_mosaic, uav_map):
+        rst_tokens = self._direction_tokens(rst_mosaic)
+        uav_tokens = self._direction_tokens(uav_map)
+        queries = self.heading_queries.to(dtype=uav_tokens.dtype).expand(
+            uav_tokens.size(0), -1, -1
+        )
+        rst_relation, _ = self.relation_attention(
+            queries, rst_tokens, rst_tokens, need_weights=False
+        )
+        uav_relation, _ = self.relation_attention(
+            queries, uav_tokens, uav_tokens, need_weights=False
+        )
+        rst_relation = self.query_norm(rst_relation + queries)
+        uav_relation = self.query_norm(uav_relation + queries)
+        relation = self.relation_projection(
+            torch.cat(
+                (
+                    uav_relation,
+                    rst_relation,
+                    uav_relation - rst_relation,
+                    uav_relation * rst_relation,
+                ),
+                dim=-1,
+            )
+        ).mean(dim=1)
+        heading = F.normalize(
+            self.heading_regressor(relation), p=2, dim=-1, eps=1e-6
+        )
+        return heading, relation
+
+    @staticmethod
+    def rotate_image_heading(heading, quarter_turns):
+        """Rotate x-right/y-down heading vectors like torch.rot90 image content."""
+        quarter_turns = int(quarter_turns) % 4
+        if quarter_turns == 0:
+            return heading
+        x_coord, y_coord = heading.unbind(dim=-1)
+        if quarter_turns == 1:
+            return torch.stack((y_coord, -x_coord), dim=-1)
+        if quarter_turns == 2:
+            return torch.stack((-x_coord, -y_coord), dim=-1)
+        return torch.stack((-y_coord, x_coord), dim=-1)
+
+    def forward(
+        self,
+        rst_maps,
+        uav_map,
+        official_combined,
+        base_heading,
+        compute_rotation_consistency=True,
+    ):
+        if rst_maps.dim() != 5 or rst_maps.size(1) != 4:
+            raise ValueError("IDRA requires four RST feature maps")
+        rst_mosaic = RSTGlobalContextFusion.build_mosaic(rst_maps)
+        implicit_heading, relation = self._implicit_heading(rst_mosaic, uav_map)
+        base_heading = F.normalize(base_heading, p=2, dim=-1, eps=1e-6)
+        gate = torch.sigmoid(
+            self.heading_gate(torch.cat((official_combined, relation), dim=-1))
+        )
+        final_heading = F.normalize(
+            (1.0 - gate) * base_heading + gate * implicit_heading,
+            p=2,
+            dim=-1,
+            eps=1e-6,
+        )
+
+        rotation_consistency = final_heading.new_zeros(())
+        quarter_turns = 0
+        if compute_rotation_consistency:
+            if self.training:
+                quarter_turns = int(
+                    torch.randint(1, 4, (), device=uav_map.device).item()
+                )
+            else:
+                quarter_turns = 1
+            rotated_heading, _ = self._implicit_heading(
+                rst_mosaic, torch.rot90(uav_map, quarter_turns, dims=(-2, -1))
+            )
+            expected_heading = self.rotate_image_heading(
+                implicit_heading, quarter_turns
+            )
+            rotation_consistency = (
+                1.0
+                - (rotated_heading * expected_heading.detach()).sum(dim=-1)
+            ).mean()
+
+        return final_heading, {
+            'base_heading': base_heading,
+            'implicit_heading': implicit_heading,
+            'final_heading': final_heading,
+            'heading_relation': relation,
+            'heading_gate': gate,
+            'rotation_quarter_turns': final_heading.new_tensor(quarter_turns),
+            'rotation_consistency': rotation_consistency,
+        }
+
+
 class SpatialGuidedCyclicDirectionCA(nn.Module):
     """Parallel direction-aware CA over four north-aligned RST feature maps."""
 
@@ -2749,6 +2955,156 @@ class PARCASGM_v5a_GlobalRST_PosPrior(PARCASGM_v5a_GlobalRST):
         return pos_pred, dir_pred
 
 
+class PARCASGM_v5a_GlobalRST_PosPrior_IDRA(
+    PARCASGM_v5a_GlobalRST_PosPrior
+):
+    """Experiment H6-D: Experiment F plus an implicit parallel heading adapter."""
+
+    model_name = 'phr5_f_h6d_idra'
+    default_loss_type = 'idra'
+    uses_heading_distribution_loss = True
+
+    def __init__(
+        self,
+        *args,
+        heading_relation_dim=128,
+        heading_spatial_size=8,
+        heading_num_queries=4,
+        heading_num_heads=4,
+        heading_dropout=0.1,
+        heading_gate_bias=-2.0,
+        heading_rotation_consistency_weight=0.02,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        if heading_rotation_consistency_weight < 0:
+            raise ValueError("Rotation consistency weight must be non-negative")
+        self.model_name = type(self).model_name
+        self.heading_rotation_consistency_weight = float(
+            heading_rotation_consistency_weight
+        )
+        descriptor_dim = self.feature_dim * self.num_clusters
+        self.idra_heading = ImplicitDirectionalRelationAdapter(
+            input_dim=self.feature_dim,
+            descriptor_dim=descriptor_dim,
+            relation_dim=heading_relation_dim,
+            spatial_size=heading_spatial_size,
+            num_queries=heading_num_queries,
+            num_heads=heading_num_heads,
+            dropout=heading_dropout,
+            gate_bias=heading_gate_bias,
+        )
+
+    def forward(
+        self,
+        patches,
+        debug_dir='',
+        return_aux=False,
+        attention_temperature=1.0,
+    ):
+        if patches.dim() != 5 or patches.size(1) != 5:
+            raise ValueError(
+                f"Expected patches shaped [B, 5, C, H, W], got {tuple(patches.shape)}"
+            )
+
+        batch_size = patches.size(0)
+        sgm_outputs = [self.sgm(patches[:, index]) for index in range(5)]
+        original_rst_descriptors = torch.stack(
+            [output['descriptor_flatten'] for output in sgm_outputs[:4]], dim=1
+        )
+        rst_maps = torch.stack(
+            [output['nl_feat'] for output in sgm_outputs[:4]], dim=1
+        )
+        uav_descriptor = sgm_outputs[4]['descriptor_flatten']
+        uav_map = sgm_outputs[4]['nl_feat']
+
+        fusion_output = self.rst_global_fusion(
+            rst_maps, original_rst_descriptors, return_aux=return_aux
+        )
+        if return_aux:
+            global_rst_descriptors, auxiliary = fusion_output
+        else:
+            global_rst_descriptors = fusion_output
+            auxiliary = {}
+
+        known_coords = patches.new_tensor(
+            [[-1.0, -1.0], [-1.0, 1.0], [1.0, -1.0], [1.0, 1.0]]
+        )
+        coord_embs = self.coord_encoder(known_coords).unsqueeze(0).expand(
+            batch_size, -1, -1
+        )
+        prior_output = self.sim_pos_prior(
+            uav_descriptor,
+            global_rst_descriptors,
+            temperature=attention_temperature,
+            return_weights=return_aux,
+        )
+        if return_aux:
+            pos_soft_prior, prior_weights = prior_output
+            auxiliary['attention_weights'] = prior_weights
+            auxiliary['position_prior'] = pos_soft_prior
+            auxiliary['global_rst_descriptors'] = global_rst_descriptors
+        else:
+            pos_soft_prior = prior_output
+
+        official_keys = original_rst_descriptors
+        if self.add_patch_coord:
+            official_keys = official_keys + coord_embs
+        official_context = self.neighbors_cross_attn(
+            uav_descriptor, official_keys
+        )
+        official_combined = torch.cat(
+            (uav_descriptor, official_context), dim=1
+        )
+        position = self.pos_regressor(
+            torch.cat((official_combined, pos_soft_prior), dim=1)
+        )
+        base_heading = self.dir_regressor(official_combined)
+        heading, heading_auxiliary = self.idra_heading(
+            rst_maps,
+            uav_map,
+            official_combined,
+            base_heading,
+            compute_rotation_consistency=(
+                self.heading_rotation_consistency_weight > 0
+            ),
+        )
+
+        if return_aux:
+            auxiliary.update(heading_auxiliary)
+            return position, heading, auxiliary
+        return position, heading
+
+    def compute_heading_losses(
+        self, auxiliary, target_heading, target_position=None
+    ):
+        del target_position
+        target_heading = F.normalize(
+            target_heading.float(), p=2, dim=-1, eps=1e-6
+        )
+        final_heading = F.normalize(
+            auxiliary['final_heading'].float(), p=2, dim=-1, eps=1e-6
+        )
+        implicit_heading = F.normalize(
+            auxiliary['implicit_heading'].float(), p=2, dim=-1, eps=1e-6
+        )
+        final = F.smooth_l1_loss(final_heading, target_heading)
+        implicit_alignment = (
+            1.0 - (implicit_heading * target_heading).sum(dim=-1)
+        ).mean()
+        rotation_consistency = auxiliary['rotation_consistency'].float()
+        total = (
+            final
+            + self.heading_rotation_consistency_weight * rotation_consistency
+        )
+        return {
+            'distribution': rotation_consistency,
+            'correlation': implicit_alignment,
+            'final': final,
+            'total': total,
+        }
+
+
 class PARCASGM_v5a_GlobalRST_PosPrior_C8Pose(
     PARCASGM_v5a_GlobalRST_PosPrior
 ):
@@ -5373,6 +5729,17 @@ model_kwargs_par_ca_sgm_v5a_f_sgcdca = {
     'heading_distribution_weight': 0.1,
 }
 
+model_kwargs_par_ca_sgm_v5a_f_h6d_idra = {
+    **model_kwargs_par_ca_sgm_v5a_globalrst,
+    'heading_relation_dim': 128,
+    'heading_spatial_size': 8,
+    'heading_num_queries': 4,
+    'heading_num_heads': 4,
+    'heading_dropout': 0.1,
+    'heading_gate_bias': -2.0,
+    'heading_rotation_consistency_weight': 0.02,
+}
+
 model_kwargs_par_ca_sgm_v5a_globalrst_aux = {
     **model_kwargs_par_ca_sgm_v5a_globalrst,
     'quad_loss_weight': 0.05,
@@ -5566,6 +5933,7 @@ MODEL_CLASS_DICT = {
     "PARCASGM_v5a_GlobalRST_PosPrior_CDMAuxOnly": PARCASGM_v5a_GlobalRST_PosPrior_CDMAuxOnly,
     "PARCASGM_v5a_GlobalRST_PosPrior_CSME": PARCASGM_v5a_GlobalRST_PosPrior_CSME,
     "PARCASGM_v5a_GlobalRST_PosPrior_SGCDCA": PARCASGM_v5a_GlobalRST_PosPrior_SGCDCA,
+    "PARCASGM_v5a_GlobalRST_PosPrior_IDRA": PARCASGM_v5a_GlobalRST_PosPrior_IDRA,
     "PARCASGM_v5a_GlobalRST_Quad": PARCASGM_v5a_GlobalRST_Quad,
     "PARCASGM_v5a_GlobalRST_Attn": PARCASGM_v5a_GlobalRST_Attn,
     "PARCASGM_v5a_GlobalRST_Aux": PARCASGM_v5a_GlobalRST_Aux,
@@ -5597,6 +5965,7 @@ MODEL_KEYWARDS_DICT = {
     "PARCASGM_v5a_GlobalRST_PosPrior_CDMAuxOnly": model_kwargs_par_ca_sgm_v5a_f_cdm,
     "PARCASGM_v5a_GlobalRST_PosPrior_CSME": dict(model_kwargs_par_ca_sgm_v5a_globalrst),
     "PARCASGM_v5a_GlobalRST_PosPrior_SGCDCA": model_kwargs_par_ca_sgm_v5a_f_sgcdca,
+    "PARCASGM_v5a_GlobalRST_PosPrior_IDRA": model_kwargs_par_ca_sgm_v5a_f_h6d_idra,
     "PARCASGM_v5a_GlobalRST_Quad": model_kwargs_par_ca_sgm_v5a_globalrst_quad,
     "PARCASGM_v5a_GlobalRST_Attn": model_kwargs_par_ca_sgm_v5a_globalrst_attn,
     "PARCASGM_v5a_GlobalRST_Aux": model_kwargs_par_ca_sgm_v5a_globalrst_aux,
