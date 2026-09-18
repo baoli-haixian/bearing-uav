@@ -10,6 +10,7 @@ from cvphr.models.posaglreg.models import (
     CyclicEquivariantPoseVolume,
     MODEL_CLASS_DICT,
     MODEL_KEYWARDS_DICT,
+    PARCASGM_v5a_GlobalRST_PosPrior_C8HeadingOnly,
     PARCASGM_v5a_GlobalRST_PosPrior_C8Pose,
     load_config_and_model,
 )
@@ -138,6 +139,94 @@ class ExperimentFC8PoseTest(unittest.TestCase):
             model_class, restored_kwargs = load_config_and_model(config_dir)
 
         self.assertIs(model_class, PARCASGM_v5a_GlobalRST_PosPrior_C8Pose)
+        self.assertEqual(restored_kwargs, kwargs)
+
+
+class ExperimentFC8HeadingOnlyTest(unittest.TestCase):
+    def _build_model(self):
+        name = 'PARCASGM_v5a_GlobalRST_PosPrior_C8HeadingOnly'
+        kwargs = dict(MODEL_KEYWARDS_DICT[name])
+        kwargs.update(
+            c8_feature_dim=8,
+            c8_spatial_size=4,
+            c8_residual_hidden_dim=8,
+        )
+        with patch(
+            'cvphr.models.posaglreg.models.models.vgg16',
+            return_value=_FakeVGG16(),
+        ):
+            return PARCASGM_v5a_GlobalRST_PosPrior_C8HeadingOnly(**kwargs)
+
+    def test_registration_forward_backward_and_no_position_gate(self):
+        name = 'PARCASGM_v5a_GlobalRST_PosPrior_C8HeadingOnly'
+        self.assertIs(
+            MODEL_CLASS_DICT[name],
+            PARCASGM_v5a_GlobalRST_PosPrior_C8HeadingOnly,
+        )
+        model = self._build_model()
+        patches = torch.randn(1, 5, 3, 64, 64)
+        position, heading, auxiliary = model(patches, return_aux=True)
+
+        self.assertEqual(model.model_name, 'phr5_f_c8heading')
+        self.assertFalse(hasattr(model, 'c8_position_gate_logit'))
+        self.assertEqual(tuple(position.shape), (1, 2))
+        self.assertEqual(tuple(heading.shape), (1, 2))
+        self.assertTrue(
+            torch.equal(auxiliary['position_prior'], auxiliary['f_position_prior'])
+        )
+        self.assertNotIn('c8_position_gate', auxiliary)
+
+        target_heading = nn.functional.normalize(torch.randn(1, 2), dim=-1)
+        losses = model.compute_heading_losses(auxiliary, target_heading)
+        total = position.square().mean() + losses['total']
+        total.backward()
+        branch_gradient = sum(
+            parameter.grad.abs().sum().item()
+            for parameter in model.c8_pose_branch.parameters()
+            if parameter.grad is not None
+        )
+        self.assertGreater(branch_gradient, 0.0)
+        self.assertTrue(torch.isfinite(total))
+
+    def test_c8_position_output_does_not_change_model_position(self):
+        model = self._build_model().eval()
+        patches = torch.randn(1, 5, 3, 64, 64)
+        original_forward = model.c8_pose_branch.forward
+
+        def shifted_c8_position(rst, uav):
+            position, heading, auxiliary = original_forward(rst, uav)
+            return position + 1000.0, heading, auxiliary
+
+        with torch.no_grad():
+            reference_position, _ = model(patches)
+            with patch.object(
+                model.c8_pose_branch,
+                'forward',
+                side_effect=shifted_c8_position,
+            ):
+                shifted_position, _ = model(patches)
+
+        self.assertTrue(
+            torch.allclose(reference_position, shifted_position, atol=1e-6)
+        )
+
+    def test_training_config_can_restore_heading_only_class(self):
+        name = 'PARCASGM_v5a_GlobalRST_PosPrior_C8HeadingOnly'
+        kwargs = MODEL_KEYWARDS_DICT[name]
+        with tempfile.TemporaryDirectory() as config_dir:
+            with open(
+                f'{config_dir}/training_configure.json',
+                'w',
+                encoding='utf-8',
+            ) as config_file:
+                json.dump(
+                    {'model_class': name, 'model_kwargs': kwargs}, config_file
+                )
+            model_class, restored_kwargs = load_config_and_model(config_dir)
+
+        self.assertIs(
+            model_class, PARCASGM_v5a_GlobalRST_PosPrior_C8HeadingOnly
+        )
         self.assertEqual(restored_kwargs, kwargs)
 
 

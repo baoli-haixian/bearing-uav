@@ -2930,6 +2930,108 @@ class PARCASGM_v5a_GlobalRST_PosPrior_C8Pose(
         }
 
 
+class PARCASGM_v5a_GlobalRST_PosPrior_C8HeadingOnly(
+    PARCASGM_v5a_GlobalRST_PosPrior_C8Pose
+):
+    """Experiment F plus C8 heading, without C8 position-prior fusion."""
+
+    model_name = 'phr5_f_c8heading'
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.model_name = type(self).model_name
+        # Keep experiment F's position path exact. C8 may localize internally
+        # for heading estimation, but its position output is never fused.
+        del self.c8_position_gate_logit
+
+    def forward(
+        self,
+        patches,
+        debug_dir='',
+        return_aux=False,
+        attention_temperature=1.0,
+    ):
+        del debug_dir
+        if patches.dim() != 5 or patches.size(1) != 5:
+            raise ValueError(
+                f"Expected patches shaped [B, 5, C, H, W], got {tuple(patches.shape)}"
+            )
+
+        batch_size = patches.size(0)
+        sgm_outputs = [self.sgm(patches[:, index]) for index in range(5)]
+        original_rst_descriptors = torch.stack(
+            [output['descriptor_flatten'] for output in sgm_outputs[:4]], dim=1
+        )
+        rst_maps = torch.stack(
+            [output['nl_feat'] for output in sgm_outputs[:4]], dim=1
+        )
+        global_rst_descriptors, global_auxiliary = self.rst_global_fusion(
+            rst_maps, original_rst_descriptors, return_aux=True
+        )
+        uav_descriptor = sgm_outputs[4]['descriptor_flatten']
+
+        known_coords = torch.tensor(
+            [[-1.0, -1.0], [-1.0, 1.0], [1.0, -1.0], [1.0, 1.0]],
+            dtype=patches.dtype,
+            device=patches.device,
+        )
+        coord_embs = self.coord_encoder(known_coords).unsqueeze(0).expand(
+            batch_size, -1, -1
+        )
+
+        # Preserve experiment F's PSG prior without any C8 position mixture.
+        f_position_prior, attention_weights = self.sim_pos_prior(
+            uav_descriptor,
+            global_rst_descriptors,
+            temperature=attention_temperature,
+            return_weights=True,
+        )
+        cyclic_position, cyclic_heading, cyclic_auxiliary = self.c8_pose_branch(
+            patches[:, :4], patches[:, 4]
+        )
+
+        cross_attention_features = original_rst_descriptors
+        if self.add_patch_coord:
+            cross_attention_features = cross_attention_features + coord_embs
+        context = self.neighbors_cross_attn(
+            uav_descriptor, cross_attention_features
+        )
+        combined = torch.cat((uav_descriptor, context), dim=1)
+        position = self.pos_regressor(
+            torch.cat((combined, f_position_prior), dim=1)
+        )
+
+        official_heading = F.normalize(
+            self.dir_regressor(combined), p=2, dim=-1, eps=1e-6
+        )
+        heading_gate = torch.sigmoid(self.c8_heading_gate_logit)
+        heading = F.normalize(
+            (1.0 - heading_gate) * official_heading
+            + heading_gate * cyclic_heading,
+            p=2,
+            dim=-1,
+            eps=1e-6,
+        )
+
+        if not return_aux:
+            return position, heading
+        auxiliary = dict(global_auxiliary)
+        auxiliary.update(cyclic_auxiliary)
+        auxiliary.update(
+            {
+                'attention_weights': attention_weights,
+                'position_prior': f_position_prior,
+                'f_position_prior': f_position_prior,
+                'c8_position_diagnostic': cyclic_position,
+                'global_rst_descriptors': global_rst_descriptors,
+                'official_heading': official_heading,
+                'final_heading': heading,
+                'c8_heading_gate': heading_gate,
+            }
+        )
+        return position, heading, auxiliary
+
+
 class ContentSpatialMomentEncoding(nn.Module):
     """Encode cluster geometry in local tile coordinates (x right, y down)."""
 
@@ -5458,6 +5560,7 @@ MODEL_CLASS_DICT = {
     "PARCASGM_v5a_GlobalRST": PARCASGM_v5a_GlobalRST,
     "PARCASGM_v5a_GlobalRST_PosPrior": PARCASGM_v5a_GlobalRST_PosPrior,
     "PARCASGM_v5a_GlobalRST_PosPrior_C8Pose": PARCASGM_v5a_GlobalRST_PosPrior_C8Pose,
+    "PARCASGM_v5a_GlobalRST_PosPrior_C8HeadingOnly": PARCASGM_v5a_GlobalRST_PosPrior_C8HeadingOnly,
     "PARCASGM_v5a_GlobalRST_PosPrior_CDM": PARCASGM_v5a_GlobalRST_PosPrior_CDM,
     "PARCASGM_v5a_GlobalRST_PosPrior_CDMResidualOnly": PARCASGM_v5a_GlobalRST_PosPrior_CDMResidualOnly,
     "PARCASGM_v5a_GlobalRST_PosPrior_CDMAuxOnly": PARCASGM_v5a_GlobalRST_PosPrior_CDMAuxOnly,
@@ -5488,6 +5591,7 @@ MODEL_KEYWARDS_DICT = {
     "PARCASGM_v5a_GlobalRST": model_kwargs_par_ca_sgm_v5a_globalrst,
     "PARCASGM_v5a_GlobalRST_PosPrior": model_kwargs_par_ca_sgm_v5a_globalrst,
     "PARCASGM_v5a_GlobalRST_PosPrior_C8Pose": model_kwargs_par_ca_sgm_v5a_f_c8pose,
+    "PARCASGM_v5a_GlobalRST_PosPrior_C8HeadingOnly": model_kwargs_par_ca_sgm_v5a_f_c8pose,
     "PARCASGM_v5a_GlobalRST_PosPrior_CDM": model_kwargs_par_ca_sgm_v5a_f_cdm,
     "PARCASGM_v5a_GlobalRST_PosPrior_CDMResidualOnly": model_kwargs_par_ca_sgm_v5a_f_cdm_residual_only,
     "PARCASGM_v5a_GlobalRST_PosPrior_CDMAuxOnly": model_kwargs_par_ca_sgm_v5a_f_cdm,
