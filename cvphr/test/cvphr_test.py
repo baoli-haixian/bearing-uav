@@ -292,7 +292,7 @@ def test_par(dataset_dir,
                     pos_pred, coords,
                     dir_pred, agl_coords)
             elif loss_type in {
-                'mspcoc', 'gprvh', 'prmc', 'c8pose', 'sgcdca'
+                'mspcoc', 'gprvh', 'prmc', 'c8pose', 'sgcdca', 'idra'
             }:
                 loss_pos = criterion(pos_pred, coords)
                 loss_dir = model.compute_heading_losses(
